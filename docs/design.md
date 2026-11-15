@@ -1,7 +1,7 @@
 # QuantX：A 股日频量化回测与人工实盘系统详细设计
 
-> 文档版本：v1.0<br>
-> 状态：设计稿（可进入实现）<br>
+> 文档版本：v1.1<br>
+> 状态：设计稿（已按 review 意见修订）<br>
 > 适用市场：上海证券交易所主板、深圳证券交易所主板、创业板、科创板<br>
 > 交易方式：系统生成信号与调仓单，人工在券商客户端执行<br>
 > 最后更新：2026-11-15<br>
@@ -42,9 +42,9 @@
 2. 数据采集、清洗、校验、对齐、存储与 Point-in-Time（PIT）语义；
 3. 历史/当日股票池、可交易性判定与 A 股交易规则；
 4. 因子注册表、增量计算、预处理、第一版因子与评测体系；
-5. 等权合成、TopN 组合构建、换手控制、约束与订单生成；
-6. 基于 Backtrader 的历史回测执行器与 A 股成交模拟；
-7. 人工实盘执行、飞书推送、事前风控、回撤控制、交割单录入；
+5. 资金规模推导 N、等权合成、TopN 组合构建、换手控制、约束与订单生成；
+6. 自研 A 股日频/5 分钟回放引擎与 A 股成交模拟；
+7. 账户快照、人工实盘执行、飞书推送、事前风控、回撤控制、成交录入；
 8. 对账、归因、一致性报告、监控告警、测试与上线路线。
 
 本文档不是投资建议，也不承诺任何收益。所有阈值、因子、权重和规则均为工程默认值，需要经过样本外验证后才能用于实盘。
@@ -74,14 +74,36 @@
 |---|---|---|---|
 | D1 | 实现语言 | Python 3.11+ | 数据/因子/回测生态成熟，迭代快 |
 | D2 | 分析型存储 | Parquet + DuckDB | 列式压缩、按日分区、嵌入式无需运维，适合单机日频/5 分钟数据 |
-| D3 | 交易型存储 | SQLite（WAL） | 单用户、强一致、零运维；接口按 PostgreSQL 兼容方式设计，后续可迁移 |
-| D4 | 回测引擎 | Backtrader（执行级）+ 预计算信号 | 事件驱动、可定制 broker/费用/滑点；避免把 5000 只股票的因子计算塞进事件循环 |
-| D5 | 实盘执行 | 人工执行 + 系统记账 | 当前无券商 API 需求，避免自动化交易接入成本与风险 |
-| D6 | 组合优化 | 约束化 TopN 等权 + 换手预算 | 小资金、解释性强、避免均值方差模型的估计误差 |
+| D3 | 交易型存储 | SQLite（WAL），金额/价格用整数分 | 单用户、强一致、零运维；避免 REAL 记账误差；接口按 PostgreSQL 兼容设计 |
+| D4 | 回测引擎 | 自研 `AShareReplayEngine` + 预计算信号 | 回测只需订单/记账；自研可直接复用实盘 T+1/涨跌停/整手/费用规则，避免框架阻抗 |
+| D5 | 实盘执行 | 人工执行 + 账户快照 + 系统记账 | 无券商 API；账户快照是资金/持仓基线，无快照不交易 |
+| D6 | 组合优化 | 资金推导 N + 约束化等权 + 10% 换手预算 | 解决小资金整手/最低佣金/单票上限矛盾；解释性强 |
 | D7 | 因子合成 | 因子等权（可切换类别等权） | 第一版避免动态权重过拟合；类别等权用于控制类别数量偏置 |
-| D8 | 数据一致性 | 多源交叉校验 + 冲突隔离 | 免费源无 SLA，单一数据源错误会直接污染信号 |
-| D9 | 时间语义 | 双时间轴（业务日期 + 知识时间） | 同时解决财报公告、停复牌、ST、指数成分的历史时点问题 |
+| D8 | 数据一致性 | 2–4 周校准 + 多源交叉校验 + critical/市场分层门禁 | 免费源无 SLA；全市场 P0 会频繁 NO_TRADE |
+| D9 | 时间语义 | 业务时间 + 真实可用时间 + 首次抓取时间 + 版本时间 | 解决财报公告、停复牌、ST、指数成分和“抓到才算可用”的问题 |
 | D10 | 失败策略 | Fail-closed | 数据/风控/对账关键项失败时禁止生成可执行订单 |
+
+### 0.5 v1.1 review 修订摘要
+
+| 修订项 | 处理 |
+|---|---|
+| ST 涨跌幅 | 主板 ST 5% 仅适用于 2026-07-05 及以前；**2026-07-06 起 10%**；创业板/科创板 ST 20%；退市整理首日无涨跌幅 |
+| 回测参与率 | 订单 ≤0.1% ADV20 全额按 bar 价成交；大额订单 10% bar 量参与；1% ADV20 为事前上限 |
+| 对账时点 | 16:30 正式对账改为 **T+1**；T 日只做当日成交查询 + PRELIM；正式对账单 T+1 09:30，FORMAL T+1 10:00，13:00 截止 |
+| 券商无订单号 | `client_order_id` 可空；按 `broker_trade_id`/`broker_order_id`/复合键弱匹配，`UNMATCHED/AMBIGUOUS` 保留成交人工分配 |
+| 资金规模 | 固定 N=30/5% 改为 **由权益推导 N、单票上限、最少持仓**；默认最低 15 万；一手金额超上限的股票剔除 |
+| 换手 | 单日单边 20% 改为 **10%**，5 日累计 30%；最低佣金进入换手成本 |
+| 回测框架 | 去掉 Backtrader 依赖，改为自研 `AShareReplayEngine` |
+| 回测样本 | 长历史用 `daily-research` 2015+；`production-replay` 只做近期 5 分钟执行校准 |
+| 14:30 的 close | 明确定义 `close_d`（T-1 完整日线）与 `last_1430`；WQ101/动量用 `close_d` |
+| 免费数据源 | 增加 2–4 周校准期；P0 只覆盖持仓/Top 候选/订单关键字段，全市场原则上 P1（灾难级/非空门禁除外） |
+| Tushare | 改为可选增强，默认关闭，不作为唯一主源 |
+| 成交价 | 明确 live=实际成交、production=14:35 bar、daily=T+1 open |
+| 5 分钟 | 改为可选；日频信号只用 T-1 日线 + 14:30 快照即可运行 |
+| PIT | 区分 `available_at`、`first_seen_at`、`ingested_at`，实盘用较晚者 |
+| 股票池 | 拆为 `buy_eligible`、`hold_eligible`、`exit_required` |
+| SQLite | 金额/价格改为整数分，禁止 REAL |
+| 账户快照 | 14:20 券商账户快照；缺失/过期/不一致 -> NO_TRADE |
 
 ---
 
@@ -92,7 +114,7 @@
 构建一套可日常运行的 A 股日频量化系统：
 
 1. 每个交易日 14:30 使用 **T-1 日频数据 + T 日 14:30 盘中快照** 生成信号；
-2. 收盘前由人工按调仓单执行，收盘后录入交割单并完成对账、持仓更新和盘后流程；
+2. 收盘前由人工按调仓单执行；收盘后录入当日成交并完成初步对账/T+1 正式对账、持仓更新和盘后流程；
 3. 支持历史回测与模拟成交，回测规则尽量贴近真实 A 股交易约束；
 4. 支持因子研究、因子评测、组合构建、换手控制与风险约束；
 5. 所有关键数据、信号、订单、成交、持仓、对账结果可追溯、可复现；
@@ -108,7 +130,7 @@
 | ETF、可转债、期权、期货 | 证券主数据白名单直接排除 |
 | Level-2 行情/逐笔委托 | 不使用十档、逐笔成交、委托队列；仅使用 Level-1 快照与 5 分钟线 |
 | 自动下单 | 人工在券商客户端执行；系统不保存券商交易密码，不直连交易柜台 |
-| 市场冲击模型 | 资金规模小，默认无冲击；用参与率上限和容量监控代替 |
+| 市场冲击模型 | 资金规模小，默认无冲击；小单按 bar 价全额，大单 10% 参与率 + 容量监控 |
 | 复杂机器学习/深度学习 | 第一版以可解释的价量、基本面、WorldQuant 101 因子为主 |
 | 多因子动态择时 | 不预测大盘涨跌；回撤控制是风险 overlay，不是择时模型 |
 
@@ -120,10 +142,10 @@
 | 方向 | 只做多；目标权重均非负；现金不得为负；无融资融券 |
 | 频率 | 日频决策；每个交易日允许重新计算组合；可每日调仓，但不强制每日交易 |
 | 持有期 | 单只股票至少持有 1 个交易日；受 T+1 约束，买入当日不可卖 |
-| 资金 | 小资金；订单金额远小于日均成交额；默认无市场冲击 |
-| 数据 | 免费源为主；多源交叉校验；允许部分数据延迟，但必须有门禁和降级 |
-| 执行 | 14:30 生成信号，14:35 前推送，14:35–14:55 人工执行，15:00 收盘 |
-| 盘后 | 15:05 前录入交割单；15:30 前完成初步对账；16:30 前完成正式对账；17:00 前完成归因/日报；17:30 前完成次日准备 |
+| 资金 | 初始建议 ≥15 万元；小资金；订单金额远小于日均成交额；默认无市场冲击；N/单票上限由权益推导 |
+| 数据 | 免费源为主，Tushare 仅可选；多源交叉校验；先做 2–4 周真实数据校准；允许部分延迟但有门禁/降级 |
+| 执行 | 14:20 账户快照，14:30 生成信号，14:35 前推送，14:35–14:55 人工执行，15:00 收盘；无快照不交易 |
+| 盘后 | 15:05 当日成交查询；15:30 初步对账；T+1 09:30 正式对账单、10:00 正式对账、13:00 截止；16:30 初步归因/日报 |
 | 时区 | Asia/Shanghai；所有调度、时间戳、日志统一使用该时区，数据库存 UTC 或带时区时间 |
 | 资金流 | 第一版假设无外部申购/赎回；如发生入金/出金，必须记录现金流并调整收益计算 |
 
@@ -132,21 +154,21 @@
 | 需求 | 设计章节 | 关键实现 |
 |---|---|---|
 | 沪深主板+创业板+科创板，只做多，不融资融券 | 5.1、5.2、7.3 | 板块白名单、证券类型白名单、权重非负断言 |
-| 排除 ST、*ST、新股、退市、停牌 | 5.2、5.4 | 状态表 + 名称/公告交叉校验 + 可交易性表 |
-| 14:30 生成信号，收盘前人工执行，收盘后录入/对账 | 3.1–3.4、9 | 调度器、状态机、调仓单、交割单导入 |
+| 排除 ST、*ST、新股、退市、停牌 | 5.2、5.4 | `buy_eligible`/`hold_eligible`/`exit_required` 三态 + 可交易性 |
+| 14:30 生成信号，收盘前人工执行，收盘后录入/对账 | 3.1–3.4、9 | 14:20 账户快照、状态机、调仓单、当日查询/T+1 对账单 |
 | 日频、每日可调仓、至少持有 1 日、不盘中反复交易 | 3、7.4、9.2 | 单次信号、T+1、`min_hold_days`、订单当日失效 |
-| 数据层：T-1 日频 + T 14:30 快照 | 4.1–4.3 | 双时间轴、快照表、PIT 查询 |
-| 免费多源、交叉校验、交易日历、证券主数据、证券阻挡、OHLCV、复权因子、5 分钟、涨跌停、停牌、ST/退市、财务、快照 | 4.1–4.8 | 数据源矩阵、标准化 Schema、质量门禁 |
-| 防前视偏差、合适存储 | 4.2、4.6 | Parquet+DuckDB、`available_at`、`knowledge_date`、快照哈希 |
+| 数据层：T-1 日频 + T 14:30 快照 | 4.1–4.3 | 快照表、PIT 查询、`first_seen_at` |
+| 免费多源、交叉校验、交易日历、证券主数据、证券阻挡、OHLCV、复权因子、5 分钟（可选）、涨跌停、停牌、ST/退市、财务、快照 | 4.1–4.8 | 数据源矩阵、标准化 Schema、质量门禁 |
+| 防前视偏差、合适存储 | 4.2、4.6 | Parquet+DuckDB、`available_at`/`first_seen_at`、`knowledge_date`、快照哈希 |
 | 历史/当日股票池 | 5.3 | `universe_membership`、`universe_run`、差异报告 |
 | 因子注册表、增量、缓存、日期 x 代码 | 6.1–6.4 | `FactorSpec`、`factor_run`、Parquet panel、内容哈希 |
 | 价值/质量/动量交易/日内/WQ101 | 6.6、6.7 | 因子清单、公式、依赖、方向 |
 | 预处理：MAD、zscore、缺失 | 6.5 | 每日横截面预处理，禁止全样本统计 |
 | 评测：RankIC、IC 均值/标准差/ICIR/衰减/分层/换手/相关性 | 6.7 | `FactorEvaluator` + 指标表 + 报告 |
-| 等权合成、TopN 等权、换手控制、约束 | 7.1–7.5 | `CompositeScorer`、`PortfolioBuilder`、换手预算 |
-| 回测框架、滑点、T+1、涨跌停、停牌、整手 | 8 | Backtrader + 自定义 A 股 Broker |
-| 人工执行、风控、回撤、延迟告警、一致性报告 | 9 | 事前列、风险 overlay、SLA 告警、对账报告 |
-| IM 推送、调仓单、人工成交录入 | 9.2、9.5 | 飞书适配器、订单表、交割单导入 |
+| 等权合成、TopN 等权、换手控制、约束 | 7.1–7.5 | 资金推导 N、`CompositeScorer`、`PortfolioBuilder`、10% 换手预算 |
+| 回测框架、滑点、T+1、涨跌停、停牌、整手 | 8 | 自研 A 股回放引擎；daily-research 2015+；production-replay 近期 |
+| 人工执行、风控、回撤、延迟告警、一致性报告 | 9 | 账户快照、事前风控、回撤 overlay、PRELIM/FORMAL 对账 |
+| IM 推送、调仓单、人工成交录入 | 9.2、9.5 | 飞书适配器、订单表、弱成交匹配/人工分配 |
 
 ### 1.5 关键名词
 
@@ -197,7 +219,7 @@ flowchart LR
     end
 
     subgraph EXEC["执行层"]
-        BT["回测执行器<br/>Backtrader + A股规则"]
+        BT["回测执行器<br/>自研 A 股回放"]
         MAN["人工执行器<br/>调仓单/成交录入"]
     end
 
@@ -229,10 +251,10 @@ flowchart LR
 | 因子层 | `quantx.factors` | 注册表、依赖解析、增量计算、预处理、缓存、评测 | 不生成订单 |
 | 打分/组合 | `quantx.portfolio` | 等权合成、打分、TopN、约束、换手控制、目标权重 | 不直接下单 |
 | 订单/信号 | `quantx.signals` | 目标权重到订单、取整、限价、可交易性、调仓单、推送载荷 | 不执行成交 |
-| 回测 | `quantx.backtest` | 事件驱动模拟、A 股成交规则、费用、滑点、指标 | 不接触真实资金 |
+| 回测 | `quantx.backtest` | `AShareReplayEngine`：逐日/逐 bar 回放、A 股成交规则、费用、滑点、指标 | 不接触真实资金 |
 | 实盘 | `quantx.live` | 运行日状态、调仓单、人工执行确认、交割单录入、持仓更新 | 不自动登录券商 |
 | 风控 | `quantx.risk` | 事前检查、回撤 overlay、数据/对账门禁、告警 | 不预测收益 |
-| 对账/归因 | `quantx.recon`、`quantx.attribution` | 三方对账、差异分类、PnL/Brinson/因子归因 | 不修改原始成交 |
+| 对账/归因 | `quantx.recon`、`quantx.attribution` | PRELIM/FORMAL 对账、弱成交匹配、差异分类、PnL/Brinson/因子归因 | 不修改原始成交 |
 | 公共 | `quantx.common` | 配置、日历、日志、时钟、ID、异常、通知适配 | 不承载业务规则 |
 
 ### 2.3 核心领域对象
@@ -241,22 +263,24 @@ flowchart LR
 Security           证券主数据（代码、板块、上市/退市、整手规则、涨跌停规则）
 SecurityBlock      证券阻挡/黑名单（硬阻断、生效区间、来源）
 TradingCalendar    交易日历（开市日、上一/下一交易日、交易时段）
-DailyBar           T 日日线（不复权 OHLCV/成交额/状态）
+DailyBar           日线（不复权 OHLCV/成交额/状态；T 日信号只用 T-1 完整日线）
 MinuteBar          5 分钟线（bar_end、OHLCV/成交额）
 Snapshot1430       T 日 14:30 快照（最新价、开高低、累计量额、涨跌停、状态）
 FinancialRecord    PIT 财务记录（报告期、公告日、可用时间、字段）
 FactorSpec         因子元数据（名称、依赖、函数、版本、方向、预处理）
 FactorPanel        日期 x 代码的因子矩阵（含 available_at/universe_version）
 Universe           某日股票池及不可入池原因
-Tradability        某股票某时点 can_buy/can_sell 及原因
+Tradability        某股票某时点 can_buy/can_sell/hold_allowed/exit_required 及原因
 Score              某日每只股票的合成分
 TargetPortfolio    目标权重/目标股数/现金缓冲
 Order              调仓订单（side、qty、limit_price、reason、status）
-Fill               实际/模拟成交（数量、价格、费用、时间、broker_trade_id）
+Fill               实际/模拟成交（数量、价格、费用、时间、broker_trade_id、match_status）
+AccountSnapshot    券商账户快照（总资产、现金、持仓、可用数量、时间、来源）
+BrokerStatement    券商正式对账单（T+1 导入、内容哈希、对账状态）
 Position           持仓（total_qty、available_qty、avg_cost、market_value）
 CashLedger         现金流水（成交、费用、分红、出入金）
 RiskDecision       风控结论（PASS/WARN/BLOCK）及原因
-ReconReport        对账报告（差异、严重级别、处理状态）
+ReconReport        对账报告（PRELIM/FORMAL、差异、严重级别、处理状态）
 AttributionReport  归因报告（收益、行业、因子、执行、成本）
 ```
 
@@ -280,6 +304,7 @@ quantx/
 │   │   ├── calendar.py        # 交易日历
 │   │   ├── clock.py           # Asia/Shanghai 时钟
 │   │   ├── ids.py             # run_id/order_id/fill_id
+│   │   ├── money.py           # 整数分/Decimal 金额
 │   │   ├── logging.py         # structlog
 │   │   ├── errors.py
 │   │   └── types.py
@@ -327,20 +352,24 @@ quantx/
 │   │   ├── drawdown.py
 │   │   └── gates.py
 │   ├── backtest/
-│   │   ├── broker.py          # AShareBroker
-│   │   ├── commission.py
-│   │   ├── slippage.py
-│   │   ├── execution.py
-│   │   ├── feeds.py
+│   │   ├── engine.py          # AShareReplayEngine 主循环
+│   │   ├── matching.py        # 涨跌停/停牌/整手/参与率/部分成交
+│   │   ├── ledger.py          # T1Ledger/CashLedger/PositionLedger
+│   │   ├── corporate_actions.py
+│   │   ├── execution.py       # 成交价策略
+│   │   ├── costs.py           # 佣金/印花/过户/滑点
 │   │   └── runner.py
 │   ├── live/
 │   │   ├── run.py
+│   │   ├── account_snapshot.py
 │   │   ├── manual_executor.py
 │   │   ├── fills.py
 │   │   ├── positions.py
 │   │   └── notify.py
 │   ├── recon/
 │   │   ├── engine.py
+│   │   ├── matching.py        # 弱成交匹配
+│   │   ├── statement.py       # 券商对账单
 │   │   ├── breaks.py
 │   │   └── report.py
 │   ├── attribution/
@@ -398,26 +427,30 @@ macOS/Linux 工作站（或境内云主机）
 | 时点 | 任务 | 输入 | 输出 | 失败处理 |
 |---|---|---|---|---|
 | T-1 18:00 | 日终数据采集 | 免费源 | 原始层日线/财务/状态 | 重试；次日 08:30 前必须补齐 |
-| T-1 18:30 | 清洗/多源校验 | 原始层 | Curated PIT 层 | 冲突隔离；P0 告警 |
+| T-1 18:30 | 清洗/多源校验 | 原始层 | Curated PIT 层 | 冲突隔离；关键对象 P0 |
 | T-1 19:00 | 历史/次日预股票池 | PIT 数据 | `universe_preliminary` | 失败则 T 日不交易 |
 | T-1 19:30 | 日频因子增量 | 日线/财务 | 因子 panel | 失败则 T 日不交易 |
-| T 08:30 | 开盘前检查 + 隔夜数据补采 | 数据/日历/券商资金/公告 | `PREOPEN_OK` | 缺数据则告警并准备降级；只使用 `available_at <= 14:30` 的数据 |
+| T 08:30 | 开盘前检查 + 隔夜数据补采 | 数据/日历/公告 | `PREOPEN_OK` | 缺数据则告警；只使用 `max(available_at, first_seen_at) <= 14:30` |
 | T 08:45 | 因子缓存失效检查/重算 | 隔夜财报、复权、状态 | `factor_panel` 新版本 | 失败则沿用 T-1 版本并标注；影响持仓/候选则 NO_TRADE |
-| T 14:25 | 5 分钟线/快照预热 | 行情源 | 临时缓存 | 源失败切换备源 |
+| T 14:20 | 券商账户快照 | 券商 App/CSV/截图 | `account_snapshot` | 缺失/过期/不一致 -> NO_TRADE |
+| T 14:25 | 账户快照校验 + 5 分钟线预热 | 快照、行情源 | `ACCOUNT_SNAPSHOT_OK` | 不通过则 NO_TRADE |
 | T 14:30:00 | 捕获 14:30 快照 | 新浪/腾讯/东财 | `snapshot_1430` | 30 秒内重试；超时降级 |
-| T 14:30–14:33 | 当日股票池/可交易性 | 快照 + 状态 | `tradability` | 关键股票失败则 NO_TRADE |
-| T 14:30–14:35 | 日内因子/打分/组合/订单 | 因子 + 快照 | `TargetPortfolio` + `OrderSheet` | 失败则不推送订单 |
-| T 14:35 | 事前风控 + 飞书推送 | 订单 + 风控 | 飞书卡片 + 调仓单 | 推送失败重试/降级；仍失败 P0 |
+| T 14:30–14:33 | 当日股票池/可交易性 | 快照 + 状态 | `buy_eligible`/`hold_eligible`/`exit_required` | 关键股票失败则 NO_TRADE |
+| T 14:30–14:35 | 日内因子/打分/组合/订单 | 因子 + 快照 + 权益 | `TargetPortfolio` + `OrderSheet` | 失败则不推送订单 |
+| T 14:35 | 事前风控 + 飞书推送 | 订单 + 风控 + 账户快照 | 飞书卡片 + 调仓单 | 推送失败重试/降级；仍失败 P0 |
 | T 14:35–14:55 | 人工执行 | 调仓单 | 券商成交 | 未执行/部分执行记录原因 |
 | T 14:55 | 执行窗口关闭 | 订单 | 未成交订单过期 | 不追单，不生成盘中二次信号 |
 | T 15:00 | 收盘 | — | — | — |
-| T 15:05 | 交割单录入截止 | 券商成交 | `Fill` | 未录入则 P1 告警 |
-| T 15:15 | 持仓/现金更新 | 成交 + 公司行为 | `Position`/`CashLedger` | 失败则阻断次日信号 |
-| T 15:30 | 初步对账 | 内部台账 + 券商对账单 | `ReconReport` | 硬差异 P0 |
+| T 15:05 | 当日成交查询/成交录入 | 券商 App 成交查询 | `Fill`（可无 client_order_id） | 未录入则 P1 告警 |
+| T 15:15 | 持仓/现金更新 | 成交 + 公司行为 + 账户快照 | `Position`/`CashLedger` | 失败则阻断次日信号 |
+| T 15:30 | 初步对账（prelim） | 内部台账 + 当日成交查询 + 持仓/资金页面 | `ReconReport(PRELIM)` | 数量/现金硬差异 P0；费用差异 PENDING_FORMAL |
 | T 16:00 | 日终数据采集 | 免费源 | 原始层 | 重试 |
-| T 16:30 | 正式对账 | 三方数据 | `ReconReport` | FAIL 阻断次日 |
-| T 17:00 | 归因/日报 | 持仓/行情/基准 | 日报/归因 | 告警 |
-| T 17:30 | 次日数据准备 | 日线/财务 | 因子增量/预股票池 | 失败则次日 08:30 前补齐 |
+| T 16:30 | 初步 PnL/归因/日报 | 持仓/行情/基准 | 日报（标注 preliminary） | 告警 |
+| T+1 09:30 | 正式对账单导入 | 券商官方交割单/对账单 | `broker_statement` | 缺失/延迟 -> P0 |
+| T+1 10:00 | 正式对账（formal） | 内部台账 + 券商对账单 + 行情 | `ReconReport(FORMAL)` | FAIL 阻断 T+1 14:30 信号 |
+| T+1 10:30 | 最终归因/日报 | 正式对账结果 + 行情 | 最终日报 | FORMAL 未完成则顺延并告警 |
+| T+1 13:00 | 正式对账截止 | — | `FORMAL_RECON_OK` | 未完成 -> T+1 14:30 NO_TRADE |
+| T+1 17:30 | 次日数据准备 | 日线/财务 | 因子增量/预股票池 | 失败则次日 08:30 前补齐 |
 
 > 说明：14:30 是“决策时点”，不是“数据下载时点”。14:30 之后产生的行情、公告、收盘价一律不能进入 T 日信号。T 日收盘数据只能用于 T 日盘后流程和 T+1 信号。
 
@@ -427,6 +460,7 @@ macOS/Linux 工作站（或境内云主机）
 sequenceDiagram
     autonumber
     participant SCH as 调度器
+    participant ACC as 券商账户
     participant DATA as 数据层
     participant UNI as 股票池
     participant FACT as 因子/组合
@@ -435,10 +469,13 @@ sequenceDiagram
     participant HUM as 交易员
     participant OPS as 对账/归因
 
-    SCH->>DATA: 14:30:00 捕获快照（多源）
+    SCH->>ACC: 14:20 抓取账户快照
+    ACC-->>SCH: 总资产/可用资金/持仓/可用数量
+    Note over SCH,RISK: 账户快照缺失/过期/不一致 => NO_TRADE
+    SCH->>DATA: 14:30:00 捕获行情快照（多源）
     DATA-->>SCH: snapshot_1430 + 质量标记
     SCH->>UNI: 构建当日股票池/可交易性
-    UNI-->>SCH: can_buy / can_sell / 原因
+    UNI-->>SCH: buy_eligible / hold_eligible / exit_required
     SCH->>FACT: 计算日内因子 + 读取 T-1 日频因子
     FACT-->>SCH: score / target portfolio
     SCH->>RISK: 目标组合预检（现金/换手/单票/行业/回撤/数据）
@@ -451,7 +488,7 @@ sequenceDiagram
             SCH->>IM: 推送调仓单 + 风险摘要
             IM-->>HUM: 飞书卡片
             HUM->>HUM: 14:35–14:55 券商客户端执行
-            HUM->>OPS: 15:05 前录入交割单
+            HUM->>OPS: 15:05 当日成交查询；T+1 09:30 正式对账单
         else 订单预检阻断
             RISK-->>SCH: BLOCK + 原因
             SCH->>IM: 推送 NO_TRADE 告警
@@ -467,14 +504,16 @@ sequenceDiagram
 
 ```text
 15:00 收盘
-  -> 15:05 交割单导入（CSV/手工）
+  -> 15:05 当日成交查询导入（券商 App/CSV；允许无 client_order_id）
   -> 15:15 成交校验、持仓/现金更新、T+1 可用数量滚动
-  -> 15:30 初步对账（订单 vs 成交 vs 持仓 vs 券商）
+  -> 15:15 收盘账户快照（总资产/现金/持仓/可用数量）
+  -> 15:30 初步对账 PRELIM（内部台账 vs 当日成交查询 vs 持仓/资金页面）
   -> 16:00 日终行情/财务/状态采集
-  -> 16:30 正式对账 + 公司行为处理
-  -> 17:00 当日 PnL、行业/因子/执行归因、日报
-  -> 17:30 次日因子增量、预股票池、数据质量报告
+  -> 16:30 初步 PnL、行业/因子/执行归因、日报（标注 preliminary）
   -> 18:00 备份、归档、告警汇总
+  -> T+1 09:30 券商正式对账单/交割单导入
+  -> T+1 10:00 正式对账 FORMAL（内部台账 vs 券商对账单 vs 行情）
+  -> T+1 13:00 正式对账截止；未完成则 T+1 14:30 NO_TRADE
 ```
 
 盘后必须回答的五个问题：
@@ -490,20 +529,25 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> INIT
-    INIT --> PREOPEN_OK: 08:30 数据/日历/资金检查通过
-    PREOPEN_OK --> SNAPSHOT_READY: 14:30 快照通过质量门禁
+    INIT --> PREOPEN_OK: 08:30 数据/日历检查通过
+    PREOPEN_OK --> ACCOUNT_SNAPSHOT_OK: 14:25 券商账户快照有效
+    PREOPEN_OK --> NO_TRADE: 14:25 账户快照缺失/过期/不一致
+    ACCOUNT_SNAPSHOT_OK --> SNAPSHOT_READY: 14:30 行情快照通过质量门禁
+    ACCOUNT_SNAPSHOT_OK --> NO_TRADE: 14:30 行情快照失败/超时
     SNAPSHOT_READY --> UNIVERSE_READY: 当日股票池/可交易性生成
     UNIVERSE_READY --> SIGNAL_READY: 因子/打分/目标组合完成
     SIGNAL_READY --> RISK_APPROVED: 事前风控 PASS
     SIGNAL_READY --> NO_TRADE: 风控 BLOCK
     RISK_APPROVED --> PUSHED: 飞书推送成功
     PUSHED --> EXECUTING: 人工确认开始执行
-    EXECUTING --> FILLS_IMPORTED: 交割单导入并校验
-    FILLS_IMPORTED --> RECONCILED: 对账 PASS/WARN
-    FILLS_IMPORTED --> RECON_FAIL: 对账 FAIL
-    RECONCILED --> REPORTED: 归因/日报完成
+    EXECUTING --> FILLS_IMPORTED: 当日成交查询导入并校验
+    FILLS_IMPORTED --> PRELIM_RECONCILED: 初步对账 PASS/WARN
+    FILLS_IMPORTED --> RECON_FAIL: 初步对账 FAIL
+    PRELIM_RECONCILED --> FORMAL_RECONCILED: T+1 正式对账 PASS
+    PRELIM_RECONCILED --> RECON_FAIL: T+1 正式对账 FAIL/超时
+    FORMAL_RECONCILED --> REPORTED: 最终归因/日报完成
     RECON_FAIL --> MANUAL_REVIEW: 人工处理差异
-    MANUAL_REVIEW --> RECONCILED: 差异关闭
+    MANUAL_REVIEW --> FORMAL_RECONCILED: 差异关闭
     REPORTED --> CLOSED
     NO_TRADE --> CLOSED
     CLOSED --> [*]
@@ -511,24 +555,30 @@ stateDiagram-v2
 
 状态规则：
 
+- `ACCOUNT_SNAPSHOT_OK` 是硬前置：没有当日券商账户快照，不得生成可执行订单；
 - 只有 `RISK_APPROVED` 才能生成可执行调仓单；`NO_TRADE` 也必须推送，说明原因；
 - `PUSHED` 之后不允许静默修改订单；如必须修正，生成新的 `signal_version`，旧版本作废并推送更正；
-- `RECON_FAIL` 是硬状态：次日 `signal run` 默认拒绝执行，直到差异关闭或显式 override（记录原因、审批人、时间）；
+- `PRELIM_RECONCILED` 只代表当日成交查询/页面级对账通过，不能替代 `FORMAL_RECONCILED`；
+- `RECON_FAIL` 或 T+1 13:00 前未完成正式对账：T+1 14:30 信号默认拒绝执行，直到差异关闭或显式 override（记录原因、审批人、时间）；
 - 所有状态转换写入 `signal_run`/`job_run`，包含操作者、时间、输入哈希、输出哈希。
 
 ### 3.5 SLA 与延迟告警
 
 | 监控项 | 正常阈值 | 告警阈值 | 级别 | 处理 |
 |---|---|---|---|---|
-| 14:30 快照时间戳 | ≤ 14:30:30 | > 14:30:30 或缺失 | P0 | 重试备源；仍失败则 NO_TRADE |
-| 快照多源价差 | ≤ 0.1% | > 0.1% | P1 | 标记冲突；关键股票升级 P0 |
+| 券商账户快照 | 14:20 前 | 14:25 缺失/过期 | P0 | 当日 NO_TRADE |
+| 账户快照与台账差异 | 数量 0；现金 ≤0.01 元 | 超差 | P0 | 当日 NO_TRADE/人工复核 |
+| 14:30 快照时间戳 | ≤ 14:30:30 | > 14:30:30 或缺失 | P0 | 重试备源；仍失败 NO_TRADE |
+| 快照多源价差 | ≤ 0.1% | > 0.2% | P1 | 标记冲突；关键股票 P0 |
 | 股票池构建 | ≤ 60 秒 | > 120 秒 | P1 | 检查数据/代码 |
 | 因子+组合计算 | ≤ 3 分钟 | > 5 分钟 | P1 | 缓存/降级；超过 14:40 不推送 |
 | 风控检查 | ≤ 30 秒 | > 60 秒 | P1 | 阻断 |
 | 飞书推送 | 14:35 前 | 14:35 未成功 | P1 | 重试/备用通道；14:40 未成功 P0 |
 | 人工确认 | 14:40 前 | 14:45 未确认 | P1 | 电话/私聊提醒 |
-| 成交录入 | 15:05 前 | 15:15 未完成 | P1 | 阻断对账 |
-| 正式对账 | 16:30 前 | 17:00 未完成 | P1 | 人工介入 |
+| 当日成交录入 | 15:05 前 | 15:15 未完成 | P1 | 阻断初步对账 |
+| 初步对账 | 15:30 前 | 16:00 未完成 | P1 | 人工介入 |
+| 正式对账单导入 | T+1 09:30 前 | T+1 10:00 未完成 | P0 | 正式对账延迟 |
+| 正式对账 | T+1 10:00 前 | T+1 13:00 未完成 | P0 | T+1 14:30 NO_TRADE |
 | 次日数据准备 | 18:00 前 | 次日 08:30 未完成 | P0 | 次日 NO_TRADE |
 
 告警通道：
@@ -542,13 +592,18 @@ stateDiagram-v2
 
 | 故障 | 检测 | 降级 | 是否允许交易 |
 |---|---|---|---|
+| 账户快照缺失/过期 | 14:25 检查 | 无降级；等待人工补抓 | NO_TRADE |
+| 账户快照与台账不一致 | 数量/现金超差 | 人工复核 | NO_TRADE |
 | 主数据源日线缺失 | 行数/覆盖率 | 备源补齐，标记 `SOURCE_FALLBACK` | 关键字段一致则允许 |
-| 多源收盘价冲突 | 价差 > 0.1% | 隔离该股票；不自动平均 | 该股票不可交易；持仓股冲突则 NO_TRADE |
+| 关键股票收盘价/前收/涨跌停冲突 | critical 字段冲突 | 隔离该股票；不自动平均 | 持仓股 NO_TRADE；候选剔除 |
+| 全市场冲突率升高 | market 指标超阈值 | P1 告警 + 隔离 | 允许（除非覆盖率跌破地板） |
 | 14:30 快照延迟 | 时间戳 > 30 秒 | 备源；缩短计算 | 超 14:35 未就绪则 NO_TRADE |
-| 5 分钟线缺失 | 最新 bar < 14:25 | 用 14:25 bar 并标记 | 关键因子缺失则降级/NO_TRADE |
+| 5 分钟线缺失 | 最新 bar < 14:25 | 日频因子照常；日内因子 NaN/降级 | 不因 5 分钟缺失直接 NO_TRADE |
 | 因子计算失败 | 异常/覆盖率低 | 使用上一版缓存（仅当输入未变） | 输入变化则 NO_TRADE |
 | 飞书推送失败 | HTTP/超时 | 重试 3 次 + 备用通道 | 人工可从本地调仓单执行；必须记录 |
-| 券商成交未录入 | 15:05 检查 | 人工补录 | 对账前不允许次日信号 |
+| 当日成交查询未录入 | 15:05 检查 | 人工补录 | 初步对账前不阻断，但 FORMAL 前必须补齐 |
+| 券商对账单无 client_order_id | 导入检查 | 弱匹配/人工分配 | 允许；未匹配成交 P0 |
+| 正式对账单延迟 | T+1 09:30 检查 | 等待/人工获取 | T+1 14:30 NO_TRADE |
 | 对账硬差异 | qty/cash 不一致 | 人工复核 | 次日 NO_TRADE，直到关闭 |
 | 回撤超阈值 | 日终/14:30 | 降暴露/只卖不买 | 按回撤等级执行 |
 | 重复运行 | 同 `run_id` | 幂等返回；强制重跑生成新版本 | 旧订单作废 |
@@ -561,23 +616,36 @@ stateDiagram-v2
 
 免费数据源没有 SLA，且接口、字段、频率可能变化。设计上采用“**主源 + 备源 + 权威源校验**”，任何单源异常都不能静默进入信号。
 
-| 数据集 | 主源 | 备源 | 权威/校验源 | 频率/延迟 | 关键注意点 |
+| 数据集 | 主源（免费/默认可） | 备源 | 权威/校验源 | 频率/延迟 | 关键注意点 |
 |---|---|---|---|---|---|
-| 交易日历 | Tushare `trade_cal` | Baostock | 交易所公告 | 日 | 节假日、临时休市；必须保留历史版本 |
-| 证券主数据 | Tushare `stock_basic` | Baostock | 交易所/巨潮 | 日 | 代码、板块、上市/退市、名称历史 |
-| 证券阻挡/黑名单 | 交易所/监管公告 | 巨潮/东财 | 交易所 | 日/事件 | 长期停牌、风险警示、退市、禁止交易证券；只做排除，不做选股 |
-| 日线 OHLCV（不复权） | Tushare `daily` | Baostock | 东财/新浪 | T 日 15:30 后 | 单位不同；停牌日可能无记录 |
-| 复权因子 | Tushare `adj_factor` | Baostock 复权价反推 | 东财 | 日 | 因子方向/基准；避免用未来因子 |
-| 5 分钟线 | Baostock | 东财/腾讯 | 交易所行情 | 盘中/历史 | 历史深度有限；bar 时间戳语义 |
-| 14:30 快照 | 新浪 | 腾讯/东财 | 交易所时间戳 | 实时 | 多源并发抓取；30 秒超时 |
-| 每日涨跌停价 | 计算 | 东财快照字段 | 交易所规则 | 日/实时 | 除权日参考价；ST/板块规则 |
+| 交易日历 | Baostock / 交易所日历 | 东财 | 交易所公告 | 日 | 节假日、临时休市；保留历史版本 |
+| 证券主数据 | Baostock / 交易所 | 东财/巨潮 | 交易所/巨潮 | 日 | 代码、板块、上市/退市、名称历史 |
+| 证券阻挡/黑名单 | 交易所/监管公告 | 巨潮/东财 | 交易所 | 日/事件 | 长期停牌、风险警示、退市、禁止交易证券；只做排除 |
+| 日线 OHLCV（不复权） | Baostock | 东财/新浪/腾讯 | 交易所行情 | T 日 15:30 后 | 单位不同；停牌日可能无记录 |
+| 复权因子 | Baostock 复权价反推 | 东财 | 交易所/行情源 | 日 | 因子方向/基准；避免用未来因子 |
+| 5 分钟线 | Baostock | 东财/腾讯 | 交易所行情 | 盘中/历史 | 历史深度有限；**可选**，不阻塞日频信号 |
+| 14:30 快照 | 新浪 | 腾讯/东财 | 交易所时间戳 | 实时 | 多源并发；30 秒超时 |
+| 每日涨跌停价 | 规则计算 | 东财快照字段 | 交易所规则 | 日/实时 | 除权日参考价；ST/板块/日期规则 |
 | 停牌/复牌 | 日线缺失 + Baostock `tradestatus` | 东财状态 | 交易所公告 | 日 | 不能把“缺失”直接当停牌 |
 | ST/*ST/退市整理 | 名称历史 + 状态表 | 东财/交易所 | 巨潮公告 | 日 | 名称法有历史误差，公告优先 |
-| 财务指标 | Tushare 财报接口 | Baostock | 巨潮/东财 | 季度/公告日 | 必须用公告日，不用报告期 |
-| 行业分类 | Tushare SW | 东财 | 申万/交易所 | 日/季度 | 历史成分与生效日；避免未来分类 |
-| 公司行为 | Tushare `dividend` | 巨潮/东财 | 交易所公告 | 日 | 分红、送转、配股、除权参考价 |
-| 指数/基准 | Tushare `index_daily` | 东财 | 中证/交易所 | 日 | 沪深 300/500/1000/全指 |
+| 财务指标 | Baostock | 巨潮/东财 | 巨潮/交易所 | 季度/公告日 | 必须用公告日，不用报告期 |
+| 行业分类 | 东财/申万 | 巨潮 | 申万/交易所 | 日/季度 | 历史成分与生效日；避免未来分类 |
+| 公司行为 | 巨潮/东财 | 交易所公告 | 交易所 | 日 | 分红、送转、配股、除权参考价 |
+| 指数/基准 | 东财/中证 | 交易所 | 中证/交易所 | 日 | 沪深 300/500/1000/全指 |
 | 公告 | 巨潮 | 交易所 | 巨潮 | 日 | ST、退市、风险提示、财报 |
+| Tushare（可选增强） | 有 token/积分时启用 | — | — | 视权限 | **不假设免费**；无权限/积分不足时自动禁用，不作为唯一主源 |
+
+### 4.1.1 数据源校准期（必须先做）
+
+免费源的真实覆盖率、延迟、冲突率不能靠拍脑袋设阈值。上线前必须先跑 **2–4 周真实数据校准**：
+
+1. 每天采集所有可用源，只记录、不交易；
+2. 统计每个字段的覆盖率、缺失率、多源冲突率、快照延迟、单位异常；
+3. 用校准结果设置 P1 阈值和隔离规则；
+4. P0 只绑定“持仓 + Top 候选 + 订单相关”的关键字段；
+5. 校准结束后冻结一版 `data_gate_profile`，后续变更需重新校准。
+
+校准期输出 `reports/data_calibration/{yyyyww}/`，至少包含：覆盖率、冲突率、延迟分布、单位异常、关键字段样本核对。
 
 数据源使用要求：
 
@@ -655,7 +723,7 @@ data/
 
 ### 4.3 核心数据集与 Schema
 
-以下为逻辑 Schema；物理 Parquet 可增减字段，但语义必须保持一致。
+以下为逻辑 Schema；物理 Parquet 可增减字段，但语义必须保持一致。**所有原始/状态/财务/行情表都必须包含 `first_seen_at`、`available_at`、`available_at_quality`**；为简洁，部分表只列关键字段。
 
 #### 4.3.1 交易日历 `trading_calendar`
 
@@ -725,7 +793,9 @@ data/
 | `sources_used` | VARCHAR | 参与校验的源 |
 | `quality_flags` | INT | 位掩码 |
 | `ingested_at` | TIMESTAMP | 入库时间 |
-| `available_at` | TIMESTAMP | 可使用时点（≥收盘后） |
+| `first_seen_at` | TIMESTAMP | 首次成功抓取时间 |
+| `available_at` | TIMESTAMP | 真实可用时间（≥收盘后） |
+| `available_at_quality` | VARCHAR | EXACT/ESTIMATED/CAPTURE_ONLY |
 | `knowledge_date` | DATE | 知识日期 |
 | `schema_version` | INT | 版本 |
 
@@ -742,7 +812,9 @@ data/
 | `vwap` | DECIMAL(18,4) | amount/volume |
 | `source` | VARCHAR | 来源 |
 | `quality_flags` | INT | 质量标记 |
-| `available_at` | TIMESTAMP | bar 可使用时点（≥bar_end） |
+| `first_seen_at` | TIMESTAMP | 首次成功抓取时间 |
+| `available_at` | TIMESTAMP | bar 真实可用时间（≥bar_end） |
+| `available_at_quality` | VARCHAR | EXACT/ESTIMATED/CAPTURE_ONLY |
 
 时间戳约定：
 
@@ -776,7 +848,9 @@ data/
 | `source_count` | INT | 成功源数量 |
 | `crosscheck_status` | VARCHAR | OK/WARN/CONFLICT |
 | `quality_flags` | INT | 位掩码 |
-| `available_at` | TIMESTAMP | 抓取完成时间 |
+| `first_seen_at` | TIMESTAMP | 首次成功抓取时间 |
+| `available_at` | TIMESTAMP | 快照真实可用时间（≤captured_at） |
+| `available_at_quality` | VARCHAR | EXACT/ESTIMATED/CAPTURE_ONLY |
 
 > 快照只使用 Level-1 信息；`bid1/ask1` 仅用于人工执行参考，不构建盘口类因子。
 
@@ -789,7 +863,9 @@ data/
 | `adj_factor` | DOUBLE | 累计复权因子 |
 | `source` | VARCHAR | 来源 |
 | `knowledge_date` | DATE | 版本日期 |
-| `available_at` | TIMESTAMP | 可使用时点 |
+| `first_seen_at` | TIMESTAMP | 首次成功抓取时间 |
+| `available_at` | TIMESTAMP | 真实可用时间 |
+| `available_at_quality` | VARCHAR | EXACT/ESTIMATED/CAPTURE_ONLY |
 
 复权约定：
 
@@ -822,7 +898,9 @@ data/
 | `gross_margin` | DECIMAL | 毛利率 |
 | `source` | VARCHAR | 来源 |
 | `knowledge_date` | DATE | 版本日期 |
-| `available_at` | TIMESTAMP | 可使用时点 |
+| `first_seen_at` | TIMESTAMP | 首次成功抓取时间 |
+| `available_at` | TIMESTAMP | 真实可用时间（公告日 18:00 等） |
+| `available_at_quality` | VARCHAR | EXACT/ESTIMATED/CAPTURE_ONLY |
 | `revision` | INT | 重述版本 |
 
 PIT 规则：
@@ -849,7 +927,9 @@ PIT 规则：
 | `limit_up/limit_down` | 当日涨跌停价 |
 | `name` | 当日简称 |
 | `source` | 来源 |
-| `available_at` | 可使用时点 |
+| `first_seen_at` | 首次成功抓取时间 |
+| `available_at` | 真实可用时间 |
+| `available_at_quality` | EXACT/ESTIMATED/CAPTURE_ONLY |
 
 `security_blocklist`（证券阻挡/黑名单）：
 
@@ -860,7 +940,9 @@ PIT 规则：
 | `reason` | 阻挡原因 |
 | `effective_from` / `effective_to` | 生效区间 |
 | `source` | 来源/公告 |
-| `available_at` | 可使用时点 |
+| `first_seen_at` | 首次成功抓取时间 |
+| `available_at` | 真实可用时间 |
+| `available_at_quality` | EXACT/ESTIMATED/CAPTURE_ONLY |
 | `is_hard_block` | 是否硬阻断（硬阻断不得人工绕过） |
 
 阻挡层与股票池的关系：股票池是“选股资格”，阻挡层是“合规/交易禁止”。硬阻断优先级最高，任何因子分数都不能覆盖。
@@ -909,6 +991,53 @@ PIT 规则：
 | `source` | 来源 |
 
 第一版行业分类允许使用供应商当前分类 + 生效日回填；若历史分类不可得，必须在回测报告中声明“行业分类存在前视风险”，并优先用行业中性化降低影响。
+
+#### 4.3.10 券商账户快照 `account_snapshot`
+
+人工执行没有券商 API，必须在 14:20 前后从券商 App/CSV/截图抓取一份**账户快照**，作为当日交易的资金/持仓基线。没有有效快照 -> NO_TRADE。
+
+`account_snapshot`：
+
+| 字段 | 说明 |
+|---|---|
+| `snapshot_id` | 快照 ID |
+| `trade_date` | 交易日 |
+| `captured_at` | 快照时间（券商页面时间/录入时间） |
+| `captured_by` | 操作者 |
+| `source` | APP/CSV/SCREENSHOT/MANUAL |
+| `total_assets_cents` | 总资产（分） |
+| `cash_cents` | 现金（分） |
+| `available_cash_cents` | 可用资金（分） |
+| `market_value_cents` | 持仓市值（分） |
+| `frozen_cents` | 冻结资金（分） |
+| `position_count` | 持仓只数 |
+| `content_hash` | 截图/CSV 内容哈希 |
+| `file_path` | 原始文件路径 |
+| `status` | VALID/STALE/MISMATCH |
+| `first_seen_at` | 系统首次拿到快照的时间 |
+| `available_at` | 快照真实可用时间 |
+| `available_at_quality` | EXACT/ESTIMATED/CAPTURE_ONLY |
+| `created_at` | 入库时间 |
+
+`account_snapshot_position`：
+
+| 字段 | 说明 |
+|---|---|
+| `snapshot_id` | 快照 ID |
+| `code` | 代码 |
+| `total_qty` | 总数量 |
+| `available_qty` | 可卖数量 |
+| `avg_cost_cents` | 成本（分） |
+| `market_value_cents` | 市值（分） |
+
+校验：
+
+- 快照时间距 14:30 不超过 15 分钟；超过标记 `STALE`；
+- 总资产 = 现金 + 持仓市值 + 冻结资金（允许 0.01 元误差）；
+- 持仓数量/可用数量与内部台账逐只对比；数量不一致 -> `MISMATCH` -> NO_TRADE；
+- 截图必须能看清账户、日期、总资产、可用资金、持仓；否则视为无效；
+- 收盘后再抓一份快照，用于 15:15 持仓/现金更新和初步对账；
+- 快照只作为人工执行基线，不替代 T+1 正式对账单。
 
 ### 4.4 采集、清洗与对齐
 
@@ -981,34 +1110,52 @@ PIT 规则：
 
 #### 4.5.3 冲突率门禁
 
-- 全市场日线冲突率 > 0.5%：P1，检查源/单位/接口；
-- 持仓股或候选 TopN 股票任一关键字段冲突：P0，该股票不交易；
-- 快照冲突率 > 1%：P0，NO_TRADE；
+- 全市场日线冲突率 > 校准阈值（初始 2%）：P1，检查源/单位/接口；
+- 持仓股或 Top 2N 候选任一关键字段冲突：P0，该股票不交易/持仓股 NO_TRADE；
+- 全市场快照冲突率 > 校准阈值（初始 2%）：P1；关键股票冲突仍 P0；
 - 冲突数据写入 `quarantine`，附主源/备源值、差异、时间。
 
 ### 4.6 前视偏差与 PIT
 
-#### 4.6.1 双时间轴
+#### 4.6.1 PIT 时间语义
 
-每条记录至少有两个时间：
+每条记录至少要区分**真实可用时间**与**首次抓取时间**：
 
-- **业务时间**：`trade_date` / `report_period` / `ex_date`；
-- **知识时间**：`available_at` / `knowledge_date` / `ingested_at`。
+| 字段 | 含义 | 典型值/用途 |
+|---|---|---|
+| `trade_date` / `report_period` / `ex_date` | 业务时间 | 交易日/报告期/除权日 |
+| `available_at` | 数据在现实世界中首次公开可用的时间 | 收盘后 15:30、公告发布时刻、财报公告日 18:00 |
+| `first_seen_at` | 本系统第一次成功抓取到该数据的时间 | 生产环境实际入库前的抓取时间 |
+| `ingested_at` | 数据写入存储的时间 | 可能晚于 `first_seen_at` |
+| `knowledge_date` | 来源确认/版本日期 | 财报重述、状态变更版本 |
+| `available_at_quality` | 可用时间的可信度 | `EXACT` / `ESTIMATED` / `CAPTURE_ONLY` |
 
-查询必须使用 `as_of`：
+**实时信号**必须用“真实可用时间”和“首次抓取时间”的较晚者：
+
+```text
+effective_at = max(available_at, first_seen_at)
+```
+
+否则会出现“数据 14:00 已公开，但系统 14:32 才抓到，却假装 14:30 已可用”的隐性前视。
+
+**回测**用 `available_at` + `knowledge_date` 重建历史可见性；不能用 `first_seen_at` 代替真实发布时间（否则会把“今天才抓到的历史数据”错误地排除或纳入）。如果只有 `first_seen_at`、无法还原真实发布时间，标记 `available_at_quality=CAPTURE_ONLY`，并采用保守滞后（例如下一交易日 09:00）后再使用。
+
+查询示例（回测/研究）：
 
 ```duckdb
 SELECT *
 FROM daily_bars
 WHERE trade_date <= :trade_date
-  AND available_at <= :as_of
+  AND available_at <= :data_as_of
 QUALIFY row_number() OVER (
   PARTITION BY trade_date, code
   ORDER BY knowledge_date DESC, ingested_at DESC
 ) = 1;
 ```
 
-**两个时点必须区分**：
+实时查询则把条件替换为 `max(available_at, first_seen_at) <= :decided_at`。
+
+**两个决策时点必须区分**：
 
 | 时点 | 含义 | 典型值 |
 |---|---|---|
@@ -1017,11 +1164,11 @@ QUALIFY row_number() OVER (
 
 规则：
 
-- 原始数据查询用 `data_as_of`：`available_at <= data_as_of`；
+- 原始数据查询用 `data_as_of`：回测用 `available_at <= data_as_of`；实盘用 `max(available_at, first_seen_at) <= decided_at`；
 - 派生因子写入 `available_at = computed_at`（通常晚于 14:30）；
-- 信号消费因子时用 `decided_at`：`factor.available_at <= decided_at`，同时其输入必须满足 `input.available_at <= data_as_of`；
+- 信号消费因子时用 `decided_at`：`factor.available_at <= decided_at`，同时其输入必须满足上述原始数据条件；
 - 回测中，信号在 bar 结束后计算，订单在下一 bar 执行；不得在同一 bar 内“用收盘价算信号再按收盘价成交”；
-- 本文其余部分用 `as_of` 作为简写，具体含义由上下文决定；实现时变量名必须区分 `data_as_of` 与 `decided_at`。
+- 本文其余部分用 `as_of` 作为简写，具体含义由上下文决定；实现时变量名必须区分 `data_as_of`、`decided_at`、`first_seen_at`。
 
 #### 4.6.2 典型前视陷阱与处理
 
@@ -1042,43 +1189,75 @@ QUALIFY row_number() OVER (
 - 每个因子/信号 run 记录 `input_manifest_hash`、`as_of`、`universe_version`；
 - 回测提供 `shift_test`：把未来数据整体平移/截断，信号不应变化；
 - 提供 `future_injection_test`：注入 T 日 14:30 之后的数据，断言信号不变；
+- 提供 `first_seen_test`：将某条数据的 `first_seen_at` 调到 14:31，断言 14:30 信号不使用它；
 - 代码审查禁止在因子函数中直接读“最新”文件；必须通过 `DataPortal.as_of()`；
 - 数据层 API 不暴露无 `as_of` 的便捷查询（或默认 `as_of=now` 且明确标注为研究模式）。
 
 ### 4.7 数据质量门禁
 
-#### 4.7.1 日频门禁
+#### 4.7.1 门禁分层：P0 只覆盖“会下单/持仓”的关键对象
 
-| 检查 | 阈值 | 失败动作 |
+免费数据源不可能做到全市场零缺失、零冲突。把全市场指标都设成 P0 会导致频繁 NO_TRADE，反而使系统不可用。门禁必须分层：
+
+| 范围 | 说明 | 默认级别 |
 |---|---|---|
-| 日线覆盖率 | ≥ 99.5% 应有股票 | P0，NO_TRADE |
-| 股票池非空 | ≥ 100 只 | P0 |
-| OHLC 违法率 | ≤ 0.1% | P1；违法股票隔离 |
-| 量额单位异常率 | ≤ 0.1% | P1；异常股票隔离 |
-| 多源冲突率 | ≤ 0.5% | P1；关键股票 P0 |
-| 涨跌停价缺失 | 仅无涨跌停股票允许 | P0（有涨跌停股票缺失） |
-| 复权因子缺失 | ≤ 0.1% | P0（持仓/候选股） |
-| 财务字段缺失 | 按因子最低覆盖 | 因子层处理；不阻断全市场 |
-| 日历一致性 | 与交易所日历一致 | P0 |
+| `critical` | 持仓 + Top 2N 候选 + 当日订单相关股票 | 关键字段失败 -> P0/阻断该股票或 NO_TRADE |
+| `market` | 全市场覆盖率、冲突率、异常率 | P1 告警 + 隔离；只有覆盖率跌破地板才 P0 |
+| `reference` | 财务、行业、指数等非实时字段 | P2/P1；影响因子覆盖时按因子规则处理 |
 
-#### 4.7.2 盘中门禁
+`critical` 的硬字段（必须全部通过）：
 
-| 检查 | 阈值 | 失败动作 |
-|---|---|---|
-| 快照时间戳 | ≤ 14:30:30 | 重试；14:35 未就绪 NO_TRADE |
-| 快照覆盖率 | ≥ 98% 股票池 | P0 |
-| 快照价差 | ≤ 0.1% | P1；关键股票 P0 |
-| 5 分钟线最新 bar | ≥ 14:25 | 标记 lag；必要时降级 |
-| 股票池可交易比例 | ≥ 80% | P1；过低检查数据 |
-| 涨跌停价一致性 | 100% | P0 |
-| 停牌/ST 状态冲突 | 0 关键冲突 | P0 |
+- 收盘价 `close`；
+- 前收盘/除权参考价 `preclose` / `prev_close_ref`；
+- 涨跌停价 `limit_up` / `limit_down`；
+- 停牌 `is_suspended`；
+- ST/退市整理 `is_st` / `is_delisting`；
+- 成交量 `volume`、成交额 `amount`。
 
-#### 4.7.3 门禁结果
+这些字段任一缺失/冲突：
+
+- 持仓股 -> P0，当日 NO_TRADE；
+- Top 候选 -> 剔除该股票，不阻断全市场；
+- 订单股 -> 阻断该订单；
+- 非 critical 股票 -> 隔离并 P1。
+
+#### 4.7.2 日频门禁
+
+| 检查 | 范围 | 阈值 | 失败动作 |
+|---|---|---|---|
+| 日线覆盖率 | market | 校准期确定，初始 ≥ 95% | P1；低于 80% 的灾难级才 P0 |
+| 股票池非空 | market | ≥ 100 只 | P0 |
+| OHLC 违法率 | market | 校准期确定，初始 ≤ 0.5% | P1；违法股票隔离 |
+| 量额单位异常率 | market | ≤ 0.5% | P1；异常股票隔离 |
+| 多源冲突率 | market | 校准期确定，初始 ≤ 2% | P1 |
+| 关键字段缺失/冲突 | critical | 0 | P0（持仓） / 剔除（候选） |
+| 涨跌停价缺失 | critical | 仅无涨跌停股票允许 | P0 |
+| 复权因子缺失 | critical | 0 | P0 |
+| 财务字段缺失 | reference | 按因子最低覆盖 | 因子层处理 |
+| 日历一致性 | market | 与交易所日历一致 | P0 |
+| 数据源新鲜度 | market | 校准期确定 | P1；关键股 P0 |
+
+> 阈值是初始值，必须用 4.1.1 的 2–4 周校准结果替换；不要在没有真实数据分布的情况下把 99.5% 之类的数字写死。
+
+#### 4.7.3 盘中门禁
+
+| 检查 | 范围 | 阈值 | 失败动作 |
+|---|---|---|---|
+| 快照时间戳 | critical | ≤ 14:30:30 | 重试；14:35 未就绪 NO_TRADE |
+| 快照覆盖率 | market | 校准期确定，初始 ≥ 95% | P1；关键股缺失 P0 |
+| 快照价差 | critical | ≤ 0.2% | P1；关键股 P0 |
+| 5 分钟线最新 bar | critical | ≥ 14:25 | 标记 lag；主因子依赖时降级 |
+| 股票池可交易比例 | market | ≥ 80% | P1；过低检查数据 |
+| 涨跌停价一致性 | critical | 100% | P0 |
+| 停牌/ST 状态冲突 | critical | 0 | P0 |
+
+#### 4.7.4 门禁结果
 
 - `PASS`：继续；
 - `WARN`：继续，但在调仓单/飞书卡片标注；
 - `BLOCK`：不生成可执行订单，推送 `NO_TRADE`，写 `alert`；
-- 所有门禁结果写入 `data_quality_run`，可按日复盘。
+- 所有门禁结果写入 `data_quality_run`，包含 `profile_version`、`critical_set`、`market_metrics`；
+- 校准期 `data_gate_profile` 冻结后，任何阈值变更都要记录并重新跑历史回放。
 
 ### 4.8 数据保留与备份
 
@@ -1118,26 +1297,50 @@ QUALIFY row_number() OVER (
 
 代码前缀只是初筛，最终以证券主数据的 `board`/`security_type` 为准；避免仅靠前缀误判新代码段。
 
-### 5.2 排除规则
+### 5.2 买入资格与持有/退出资格
 
-股票池资格按 `as_of` 逐日判定，任一条件不满足即排除：
+“不能买”不等于“必须卖”。规则必须拆成三个维度：
 
-| 规则 | 判定 | 默认参数 | 说明 |
-|---|---|---|---|
-| 板块 | `board in {SH_MAIN, SZ_MAIN, CHINEXT, STAR}` | — | 白名单 |
-| 证券类型 | `security_type == STOCK` | — | 排除 ETF/债券等 |
-| ST/*ST | `is_st` 或名称匹配 `ST/*ST/SST/S*ST` | 排除 | 名称/公告/状态三源；冲突时保守排除 |
-| 退市/退市整理 | `is_delisting` 或 `delisting_date <= as_of` 或名称含“退” | 排除 | 已退市、退市整理期均不买 |
-| 新股 | `listed_trading_days < 120` | 120 个交易日 | 次新股波动大、无足够历史；可按研究需要调整 |
-| 停牌 | T-1 或 T 14:30 `is_suspended` | 排除买入 | 持仓股保留，卖出挂起 |
-| 价格 | `close < 2.0` 元 | 2.0 | 避免极低价/仙股；可配置 |
-| 流动性 | `ADV20 < 2000 万元` | 2000 万 | 小资金也需可进出；按实际资金调整 |
-| 上市状态 | `listing_date > as_of` | 排除 | 未上市 |
-| 证券阻挡/黑名单 | `security_blocklist` 硬阻断 | 排除 | 优先级最高，不可人工绕过 |
-| 数据完整性 | 关键字段缺失/冲突 | 排除 | 不能把缺失当 0 |
-| 财务可用性 | 无任何可用财务数据 | 不硬性排除 | 价值/质量因子缺失；由打分覆盖度处理 |
+| 维度 | 含义 | 用途 |
+|---|---|---|
+| `buy_eligible` | 今天是否允许新买/加仓 | 选股、目标组合、订单生成 |
+| `hold_eligible` | 是否允许继续持有 | 组合优化、风险报告 |
+| `exit_required` | 是否必须退出 | 强制卖出、`pending_exit`、告警 |
 
-“ST*”说明：用户所指应包括 `ST`、`*ST`；实现上用 `is_st` 为主，名称正则覆盖 `^\*?ST`、`^S\*?ST`、`退` 等。名称历史不完整时，以公告/状态源为准；无法判定时保守排除。
+规则表：
+
+| 规则 | 禁止买入 | 禁止持有/退出 | 默认参数 | 说明 |
+|---|---|---|---|---|
+| 板块不符 | 是 | 是（强制退出） | 白名单 | 北交所/B 股/非目标板块 |
+| 证券类型不符 | 是 | 是（强制退出） | `STOCK` | ETF/债券/期权等 |
+| ST/*ST | 是 | 是（强制退出） | — | 用户要求排除；名称/公告/状态三源 |
+| 退市/退市整理 | 是 | 是（强制退出） | — | 已退市、退市整理期 |
+| 新股 | 是 | 否（可继续持有） | `listed_trading_days < 120` | 不再加仓，已有持仓可持有 |
+| 停牌 | 是 | 否（暂不能卖） | — | 持仓保留，复牌后按 `pending_exit` 处理 |
+| 价格过低 | 是 | 否 | `< 2.0` 元 | 不再买入；持仓可留待退出 |
+| 流动性不足 | 是 | 否 | `ADV20 < 2000 万元` | 不再买入；持仓按退出规则 |
+| 证券阻挡/黑名单 | 是 | 是（硬阻断） | `security_blocklist` | 不可人工绕过；持仓退出 |
+| 数据关键字段冲突 | 是 | 持仓股 -> 暂停交易/复核 | — | 不能把缺失当 0；持仓股 P0 |
+| 财务不可用 | 否 | 否 | 因子覆盖度处理 | 价值/质量缺失，不硬性排除 |
+| 行业未知 | 是 | 否 | — | 无法控制行业暴露；不新增 |
+
+实现上：
+
+```text
+buy_eligible  = board_ok & type_ok & !st & !delisting & !new & !suspended
+                & price_ok & liquidity_ok & !blocked & !data_conflict
+hold_eligible = type_ok & board_ok & !delisting & !blocked & !st
+exit_required = st | delisting | blocked | board_changed | type_changed
+```
+
+- `exit_required=True` 且 `can_sell=True` -> 生成强制卖单，优先级高于换手预算；
+- `exit_required=True` 且 `can_sell=False`（跌停/停牌）-> `PENDING_EXIT`，每日重试，不放弃；
+- `buy_eligible=False` 但 `hold_eligible=True` -> 只允许持有/减仓，不允许加仓；
+- `hold_eligible=False` 且无法卖出 -> 风险报告标注 `STUCK_POSITION`，升级告警；
+- 历史回测必须使用当时的 `buy_eligible`/`hold_eligible`，不能用今天的规则覆盖历史。
+
+“ST*”说明：用户所指应包括 `ST`、`*ST`；实现上用 `is_st` 为主，名称正则覆盖 `^\*?ST`、`^S\*?ST`、`退` 等。名称历史不完整时，以公告/状态源为准；无法判定时保守排除买入，并对持仓标记退出审查。
+
 ### 5.3 历史股票池与当日股票池
 
 #### 5.3.1 历史股票池
@@ -1176,8 +1379,11 @@ QUALIFY row_number() OVER (
 | `trade_date` | 交易日 |
 | `as_of` | 决策时点 |
 | `code` | 代码 |
-| `eligible` | 是否入池 |
-| `reason_bits` | 排除原因位掩码 |
+| `buy_eligible` | 是否允许新买/加仓 |
+| `hold_eligible` | 是否允许继续持有 |
+| `exit_required` | 是否必须退出 |
+| `exit_priority` | 退出优先级（1 最高） |
+| `reason_bits` | 原因位掩码 |
 | `reason_text` | 人类可读原因 |
 | `board` | 板块 |
 | `industry_l1` | 行业 |
@@ -1199,6 +1405,8 @@ QUALIFY row_number() OVER (
 128 LIQUIDITY      ADV20 不足
 256 DATA          数据缺失/冲突
 512 BLOCK          证券阻挡/合规
+1024 FORCE_EXIT    必须退出（ST/退市/合规）
+2048 PENDING_EXIT  应退但当前不可卖（跌停/停牌）
 ```
 
 `reason_bits` 可同时置多位；`reason_text` 用于人类排查，不能替代位掩码。
@@ -1216,6 +1424,8 @@ QUALIFY row_number() OVER (
 | `code` | 代码 |
 | `can_buy` | 是否可买 |
 | `can_sell` | 是否可卖 |
+| `hold_allowed` | 是否允许继续持有 |
+| `exit_required` | 是否必须退出 |
 | `buy_block_reason` | 涨停/停牌/ST/新股/退市/数据冲突/流动性 |
 | `sell_block_reason` | 跌停/停牌/T+1/退市/数据冲突 |
 | `last` | 14:30 最新价 |
@@ -1231,8 +1441,11 @@ QUALIFY row_number() OVER (
 
 - 涨停（`last >= limit_up - 0.005`）禁止买入；允许卖出；
 - 跌停（`last <= limit_down + 0.005`）禁止卖出；买入默认也禁止（避免接飞刀），可配置；
-- 停牌：`can_buy=false`、`can_sell=false`；
-- ST/退市整理/新股：`can_buy=false`；持仓股 `can_sell` 视流动性与跌停而定；
+- 停牌：`can_buy=false`、`can_sell=false`、`hold_allowed=true`（复牌后按 `exit_required` 处理）；
+- ST/退市整理：`can_buy=false`、`hold_allowed=false`、`exit_required=true`；持仓股 `can_sell` 视流动性与跌停而定；
+- 新股：`can_buy=false`、`hold_allowed=true`；已有持仓可继续持有，不再加仓；
+- 价格过低/流动性不足：`can_buy=false`、`hold_allowed=true`；按退出规则处理；
+- 证券阻挡：`can_buy=false`、`hold_allowed=false`、`exit_required=true`；
 - T+1：`available_qty=0` 时 `can_sell=false`；
 - 数据冲突/快照过期：`can_buy=false`、`can_sell=false`（保守）；
 - 流动性：订单超过 `1% ADV20` 时拒绝或缩量。
@@ -1246,22 +1459,28 @@ QUALIFY row_number() OVER (
 | 板块/状态 | 默认涨跌幅 | 生效说明 |
 |---|---|---|
 | 沪深主板正常 | 10% | 主板股票 |
-| 沪深主板 ST/*ST | 5% | 风险警示板 |
+| 沪深主板 ST/*ST（2026-07-05 及以前） | 5% | 历史回测必须按日期切换 |
+| 沪深主板 ST/*ST（2026-07-06 起） | 10% | 2026-07-06 新规实施，与主板普通股票一致 |
 | 创业板正常 | 20% | 2020-08-24 注册制改革后；之前 10% |
 | 创业板 ST/*ST | 20% | 改革后风险警示股票 |
 | 科创板正常 | 20% | 科创板 |
 | 科创板 ST/*ST | 20% | 科创板风险警示股票 |
 | 新股上市初期 | 无涨跌幅/特殊规则 | 科创板/创业板前 5 个交易日无涨跌幅；主板注册制后前 5 日无涨跌幅；历史规则按日期表 |
-| 退市整理期 | 10%（以交易所规则为准） | 仅用于回测/持仓处理；不买入 |
+| 退市整理期首日 | 无涨跌幅 | 首个交易日不实行价格涨跌幅限制 |
+| 退市整理期次日起（主板） | 10% | 以交易所规则为准 |
+| 退市整理期次日起（创业板/科创板） | 20% | 以交易所规则为准 |
+
+> **规则变更提示**：沪深交易所自 **2026-07-06** 起将主板风险警示股票（ST/*ST）涨跌幅限制由 5% 调整为 10%。回测/实盘规则表必须按 `effective_from/effective_to` 切换，不能用一个常量覆盖全历史。创业板、科创板风险警示股票维持 20%。退市整理期首日无涨跌幅，次日起按板块规则；具体以交易所最新业务规则为准。
 
 实现要点：
 
-- 规则表字段：`board`、`is_st`、`is_new`、`effective_from`、`effective_to`、`limit_pct`、`no_limit_days`；
+- 规则表字段：`board`、`is_st`、`is_new`、`is_delisting`、`is_delisting_first_day`、`effective_from`、`effective_to`、`limit_pct`、`no_limit_days`；
 - 涨停价 = `round_half_up(prev_close_ref * (1 + limit_pct), 2)`；跌停价同理；用 `Decimal + ROUND_HALF_UP`，不要用 Python 内置 `round`（银行家舍入）；
 - `prev_close_ref` 是除权除息参考价，不是简单的前收盘；
 - 无涨跌幅时 `limit_up/limit_down = NULL`，不能当 0；
 - 交易所规则变更必须通过配置/规则表更新，不能改代码常量；更新前用历史样本回归测试；
-- 回测和实盘共用同一 `LimitRuleEngine`。
+- 回测和实盘共用同一 `LimitRuleEngine`；
+- 规则变更留痕：主板风险警示股票 5%→10%（2026-07-06）参考 [沪深交易所新规落地报道](https://finance.eastmoney.com/a/202607063795349693.html)；退市整理期首日无涨跌幅、次日起按板块规则参考 [深交所投教问答](https://investor.szse.cn/knowledge/t20210127_584470.html)。
 
 #### 5.5.2 整手规则
 
@@ -1355,7 +1574,7 @@ def build_universe(ctx: SignalContext) -> Universe:
         last=snap.last,
     )
     df = df.with_columns(
-        eligible=(
+        buy_eligible=(
             (listed_days >= 120)
             & (~is_st)
             & (~is_delisting)
@@ -1363,7 +1582,10 @@ def build_universe(ctx: SignalContext) -> Universe:
             & (last >= 2.0)
             & (adv20 >= 20_000_000)
             & (~data_conflict)
-        )
+            & (~blocked)
+        ),
+        hold_eligible=(~is_st) & (~is_delisting) & (~blocked),
+        exit_required=(is_st | is_delisting | blocked),
     )
     return Universe(df)
 ```
@@ -1640,7 +1862,31 @@ z = (x - mean_cs(x)) / std_cs(x)
 
 第一版候选池约 40+ 个，默认合成经准入和相关性去重后保留 20–30 个，按类别均衡，避免单类过多。下列为**候选池**，最终进入默认合成前需通过 6.8 的准入与相关性去重。
 
-#### 6.6.1 价值类（Value）
+#### 6.6.1 价格与成交量口径（必须先统一）
+
+14:30 信号同时涉及“昨天的完整日线”和“今天的盘中快照”，绝不能把两者都叫 `close`。统一定义：
+
+| 名称 | 定义 | 谁使用 |
+|---|---|---|
+| `close_d` | T-1 日最后一个**完整**交易日收盘价 | 价值/质量/动量/WQ101 等日频因子 |
+| `open_d/high_d/low_d` | T-1 日完整 OHLC | 日频因子 |
+| `volume_d` / `amount_d` | T-1 日成交量/成交额 | 日频因子、ADV20 |
+| `vwap_d` | T-1 日 `amount_d / volume_d` | WQ101 |
+| `last_1430` | T 日 14:30 快照最新价 | 实盘决策价、限价、TCA |
+| `open_1430/high_1430/low_1430` | T 日截至 14:30 的开高低 | **仅**日内因子 |
+| `volume_1430/amount_1430` | T 日截至 14:30 的累计量额 | **仅**日内因子 |
+| `vwap_1430` | T 日截至 14:30 的累计 VWAP | **仅**日内因子 |
+| `close_1430` | 同 `last_1430`，仅作为别名 | **不用于**日频/WQ101 |
+
+映射规则：
+
+- 动量、WQ101、价值、质量里出现的 `close/open/high/low/volume/vwap`，默认映射到 **T-1 完整日线**；
+- 只有明确命名为 `intraday_*` 的因子才使用 `last_1430` / 5 分钟线；
+- 不允许把 `last_1430` 塞进 WQ101 的 `close`，也不允许用 T 日收盘价补 14:30 的日线；
+- `returns` 在日频因子中指 `close_d / delay(close_d,1) - 1`；日内因子另定义 `last_1430/prev_close - 1`；
+- 回测 `daily-research` 用 `close_d` 生成信号、T+1 开盘成交；`production-replay` 用同一套日频因子 + `last_1430` 生成订单、14:35 成交。
+
+#### 6.6.2 价值类（Value）
 
 | 因子 | 定义 | 方向 | 依赖 |
 |---|---|---|---|
@@ -1656,7 +1902,7 @@ z = (x - mean_cs(x)) / std_cs(x)
 - 总市值 = 总股本 × 不复权收盘价；股本用 PIT；
 - 金融股与非金融股的 BP/EP 可比性有限，依赖行业中性化；质量因子中的杠杆/应计对金融股标记缺失。
 
-#### 6.6.2 质量类（Quality）
+#### 6.6.3 质量类（Quality）
 
 | 因子 | 定义 | 方向 | 依赖 |
 |---|---|---|---|
@@ -1667,7 +1913,7 @@ z = (x - mean_cs(x)) / std_cs(x)
 | `quality_asset_turnover` | `revenue_ttm / avg_total_assets` | + | 营收、资产 |
 | `quality_cash_conversion` | `cfo_ttm / net_profit_ttm`（净利润>0） | + | 现金流、净利润 |
 
-#### 6.6.3 动量/交易类（Momentum & Trading）
+#### 6.6.4 动量/交易类（Momentum & Trading）
 
 | 因子 | 定义 | 方向（先验，需验证） | 依赖 |
 |---|---|---|---|
@@ -1688,9 +1934,9 @@ z = (x - mean_cs(x)) / std_cs(x)
 - `turnover` 用 `volume / float_shares`，或 `amount / float_market_cap`，二选一并固定；
 - 动量因子在除权日必须用复权价，否则会产生假跳变。
 
-#### 6.6.4 日内因子（Intraday）
+#### 6.6.5 日内因子（Intraday）
 
-日内因子只使用 5 分钟线和 14:30 快照，不引用 14:30 之后的数据。
+日内因子只使用 5 分钟线和 14:30 快照，不引用 14:30 之后的数据。**日内因子是可选增强，不是日频信号的前置条件**：5 分钟线不足时，关闭 `intraday_enabled`，系统仍可用 T-1 日频因子 + 14:30 快照生成订单。
 
 | 因子 | 定义 | 方向（先验） | 依赖 |
 |---|---|---|---|
@@ -1709,9 +1955,11 @@ z = (x - mean_cs(x)) / std_cs(x)
 - `expected_cum_vol_1430` 用过去 20 个交易日的同一时刻累计成交量中位数，按个股自身历史计算；
 - 日内因子容易受微观结构/噪声影响，必须看 IC 衰减和换手，不能只看 IC；
 - 不使用 L2 数据，不做大单/撤单/盘口不平衡因子；
-- 5 分钟 bar 缺失时，该因子 NaN，不用日线近似冒充日内因子。
+- 5 分钟 bar 缺失时，该因子 NaN，不用日线近似冒充日内因子；
+- 若 5 分钟数据整体不可用，关闭日内类别，组合权重在剩余因子上重新归一；报告标注 `intraday_enabled=false`；
+- 14:30 快照仍然必须存在：它用于涨停/停牌/限价/可交易性，不是可选项。
 
-#### 6.6.5 WorldQuant 101 精选
+#### 6.6.6 WorldQuant 101 精选
 
 第一版从 WQ101 中选 **17 个**仅依赖价量、不依赖行业中性化的因子，公式见附录 D。选择原则：
 
@@ -1741,11 +1989,16 @@ z = (x - mean_cs(x)) / std_cs(x)
 
 | 场景 | 入场 | 出场 | 用途 |
 |---|---|---|---|
-| 日频标准评测 | T+1 开盘 | T+1+h 收盘 | 传统因子研究，避免 T 日收盘前视 |
-| 与实盘对齐 | T 14:30 | T+h 收盘 | 评估 14:30 信号的可实现收益 |
-| 日内因子 | T 14:30 | T+1 收盘/T+h 收盘 | 日内因子的短周期衰减 |
+| 日频标准评测（长历史） | T+1 开盘 | T+1+h 收盘 | 2015 年起长历史因子研究，避免 T 日收盘前视 |
+| 与实盘对齐（近期） | T 14:30 | T+h 收盘 | 评估 14:30 信号的可实现收益/执行校准 |
+| 日内因子（近期） | T 14:30 | T+1 收盘/T+h 收盘 | 日内因子的短周期衰减 |
 
-默认同时输出两套，报告中标注口径；主口径选择“与实盘对齐”，避免回测和实盘错位。
+规则：
+
+- 日频因子在 T 14:30 的值只由 **T-1 完整日线**决定；14:30 对齐评测的入场用 `last_1430`，但因子本身不含 T 日价格；
+- 长历史主口径用“T+1 开盘”评测，因为它不依赖 5 分钟数据，可覆盖 2015 年起；
+- “与实盘对齐”口径用于近期执行校准，不用于长历史结论；
+- 两套口径都输出，报告中必须标注；不得把 T+1 开盘的收益和 14:30 的收益混在一起。
 
 #### 6.7.2 指标
 
@@ -1876,9 +2129,12 @@ w_f = 1 / (K * N_k)   # K 个类别，N_k 为该类因子数
 - 第一版默认**因子等权**，满足需求；
 - 若 WQ101 因子数量明显多于价值/质量，使用类别等权做对照，避免类别偏置；
 - 权重在训练窗口确定后冻结；不按近期 IC 动态调权（避免过拟合和换手）；
-- 缺失因子 z=0；覆盖度不足的股票不参与；
+- 单只股票缺失某因子 -> 该因子 z=0，计入覆盖度；覆盖度不足的股票不参与；
+- 某因子当日全市场覆盖率 < `min_coverage`（数据故障/5 分钟缺失）-> 该因子当日权重置 0，剩余因子重新归一；记录 `factor_dropped`；
+- `intraday_enabled=false` -> 日内类别整体剔除，剩余类别重新归一；报告标注；
+- 若 `active_factor_count=0` 或当日有效股票数不足 `min_positions` -> 不生成可执行订单，推送 NO_TRADE；
 - 合成后不再做全市场中性化；行业/市值暴露由组合约束控制；
-- 输出 `score` + `coverage` + `n_factors` + `score_version`。
+- 输出 `score` + `coverage` + `n_factors` + `active_factor_count` + `score_version`。
 
 ---
 
@@ -1890,9 +2146,11 @@ w_f = 1 / (K * N_k)   # K 个类别，N_k 为该类因子数
 
 - `score`：T 日横截面分数；
 - `universe`：当日股票池；
-- `tradability`：can_buy/can_sell；
+- `tradability`：can_buy/can_sell/hold_allowed/exit_required；
+- `account_snapshot`：14:20 券商账户快照（总资产/现金/持仓/可用数量）；
 - `prev_positions`：T-1 收盘持仓、可用数量、成本；
-- `cash`：可用现金；
+- `equity`：以快照总资产为准的当日权益；
+- `cash`：快照可用资金（与内部台账校验后）；
 - `prices`：14:30 最新价/涨跌停；
 - `constraints`：配置；
 - `risk_state`：回撤等级/暴露乘数；
@@ -1925,13 +2183,16 @@ score_i = Σ_f w_f * z_{i,f}
 | 只做多 | `w_i >= 0` | 硬 | 无负权重、无融券 |
 | 无杠杆 | `Σw_i <= 1 - cash_buffer` | 硬 | 现金账户 |
 | 现金缓冲 | 2% | 硬 | 覆盖费用/取整/滑点 |
-| 持仓数 | 20–40，目标 30 | 硬/软 | 太少集中，太多难跟踪 |
-| 单票上限 | 5% | 硬 | 等权目标 3.33%，留漂移空间 |
+| 最低资金 | `equity >= 150,000` 元 | 硬 | 低于则 NO_TRADE；小资金无法同时满足整手/佣金/分散度 |
+| 持仓数 | `N = clamp(floor(investable/min_position_value), min_n, max_n)` | 硬 | 默认 `min_n=10`、`max_n=30`、`min_position_value=15,000` |
+| 最少持仓 | `max(5, floor(0.8*N))` | 硬 | N=10 时至少 8 只；不足则 NO_TRADE/告警 |
+| 单票上限 | `min(15%, max(5%, 1.2/N))` | 硬 | N=10 约 12%，N=30 约 5%；解决高价股一手超限 |
 | 行业上限 | 20%（申万一级） | 硬 | 单一行业不超过 1/5 |
-| 换手上限 | 单日单边 20% | 硬 | 控制成本；强制退出可突破 |
-| 新增个股 | 每日 ≤ 5 只 | 软/硬 | 控制执行复杂度 |
+| 换手上限 | 单日单边 10%；5 日累计 30% | 硬 | 控制成本；强制退出可突破 |
+| 新增个股 | 每日 ≤ 5 只 | 软/硬 | 控制执行复杂度；首次建仓可显式放宽 |
 | 最小持有 | 1 个交易日 | 硬 | T+1 + `min_hold_days` |
 | 流动性 | 订单 ≤ 1% ADV20 | 硬 | 小资金也不冲击 |
+| 整手可买 | `one_lot_value <= max_weight * equity` | 硬 | 一手都超过单票上限的股票不买 |
 | 价格 | ≥ 2 元 | 硬 | 避免极低价 |
 | 可买 | `can_buy=True` | 硬 | 涨停/停牌/ST/新股/退市/冲突均不可买 |
 | 可卖 | `can_sell=True` | 硬 | 跌停/停牌/T+1 不可卖 |
@@ -1940,10 +2201,55 @@ score_i = Σ_f w_f * z_{i,f}
 | 证券阻挡 | `security_blocklist` 硬阻断 | 硬 | 不买入；持仓按规则退出 |
 | 回撤 overlay | 按等级降暴露 | 硬 | 见 9.4 |
 
+#### 7.3.1 资金规模推导 N、单票上限与最少持仓
+
+固定 `N=30` 和固定 `单票 5%` 在小资金下会自相矛盾：15 万资金等权 30 只，每只约 5,000 元；5% 上限只有 7,500 元，股价超过 75 元时一手就买不进。正确做法是**由资金规模推导 N 和单票上限**，再做整手可行性过滤。
+
+```text
+investable = equity * (1 - cash_buffer)
+N_raw = floor(investable / min_position_value)
+N = clamp(N_raw, min_n, max_n)
+
+target_weight_i = (1 - cash_buffer) / N * risk_exposure_multiplier
+max_weight = min(max_weight_abs, max(5%, 1.2 / N))
+min_positions = max(5, floor(0.8 * N))
+one_lot_value_i = last_price_i * lot_min_i
+```
+
+默认参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `cash_buffer` | 2% | 费用/取整/滑点缓冲 |
+| `min_position_value` | 15,000 元 | 低于此金额，最低佣金/整手/跟踪成本不划算 |
+| `min_n` | 10 | 低于 10 只过于集中；资金不足则 NO_TRADE |
+| `max_n` | 30 | 超过 30 只，小资金跟踪/执行成本过高 |
+| `max_weight_abs` | 15% | 单票绝对上限，防止小 N 时过度集中 |
+| `min_equity` | 150,000 元 | 低于则 NO_TRADE/只允许模拟盘；可按 `min_n` 下调但需重新校准 |
+
+示例（仅说明推导，实际以 14:30 权益计算）：
+
+| 权益 | N | 目标单票金额 | 单票上限 | 一手可买价格上限 |
+|---|---|---|---|---|
+| 100,000 | — | NO_TRADE（低于最低资金） | — | — |
+| 150,000 | 10 | 14,700 | 18,000（12%） | 180 元 |
+| 300,000 | 19 | 15,474 | 18,900（6.3%） | 189 元 |
+| 600,000 | 30 | 19,600 | 30,000（5%） | 300 元 |
+| 1,000,000 | 30 | 32,667 | 50,000（5%） | 500 元 |
+
+规则：
+
+- N 在每个交易日 14:30 用当前权益重算；N 变化时通过缓冲带/换手预算渐进调整，不强制当日全换；
+- `min_position_value` 是推导 N 的近似下限，不是硬性单票金额；取整/现金/一手容差允许目标金额略低于它；
+- 单票上限不能低于等权目标，否则永远无法建仓；公式中的 `1.2/N` 提供 20% 漂移/一手容差，绝对上限 15%；
+- 新买入必须满足 `one_lot_value <= max_weight * equity`；若目标金额不足一手但一手金额 ≤ 单票上限，允许买一手（“一手容差”），否则该股票不进入候选；
+- 已有持仓因价格上涨导致一手金额超过单票上限时，不强制卖出，但不得加仓；必要时按再平衡规则减持；
+- 资金低于 `min_equity` 时，实盘禁止下单；回测可跑低资金压力测试，但报告标注 `below_min_equity`，不得作为实盘建议；
+
 约束优先级：
 
 1. 合规/市场规则（只做多、T+1、涨跌停、停牌、ST/退市、整手）；
-2. 资金安全（现金非负、对账未失败、数据门禁）；
+2. 资金安全（现金非负、对账未失败、数据门禁、账户快照）；
 3. 风险约束（单票、行业、回撤）；
 4. 换手/成本；
 5. 分数/收益。
@@ -1968,7 +2274,7 @@ build_target(score, prev, universe, tradability, constraints, risk):
        rank <= N*(1+buffer) 且 非强制退出 且 仍合规
   4. candidates = 非持仓中：
        rank <= N*(1-buffer) 且 can_buy
-  5. forced_exits = 现有持仓中 ST/退市/长期停牌/合规剔除；
+  5. forced_exits = 现有持仓中 exit_required=True（ST/退市/阻挡/板块变更）；
        若 can_sell -> 必须卖；若不可卖 -> pending_exit
   6. 从 keep 开始，按 rank 加入 candidates，直到 N，检查行业/单票约束
   7. 计算 proposed 的 one_way_turnover
@@ -1985,10 +2291,11 @@ build_target(score, prev, universe, tradability, constraints, risk):
 
 #### 7.4.3 缓冲带
 
-- `buffer = 20%`，N=30：
-  - 现有持仓只要排名 ≤ 36 就优先保留；
-  - 新股票只有排名 ≤ 24 才优先买入；
-  - 24–36 之间是“缓冲区”，减少边界抖动带来的换手。
+- `buffer = 20%`，通用规则：
+  - 现有持仓只要排名 ≤ `N*(1+buffer)` 就优先保留；
+  - 新股票只有排名 ≤ `N*(1-buffer)` 才优先买入；
+  - 两者之间是“缓冲区”，减少边界抖动带来的换手；
+- 例：N=30 时保留 ≤36、买入 ≤24；N=10 时保留 ≤12、买入 ≤8；
 - 缓冲带不是硬性保留：如果行业超限、ST、流动性变差，仍可卖出。
 
 #### 7.4.4 换手预算
@@ -2000,24 +2307,33 @@ one_way_turnover = 0.5 * Σ_i |w_target_i - w_prev_i|
 two_way_turnover = Σ_i |w_target_i - w_prev_i|
 ```
 
-- 默认单日单边上限 20%；
-- 等权 N=30 时，换掉一只股票约贡献 `1/30 ≈ 3.33%` 单边换手；20% 约可换 6 只；
+- 默认单日单边上限 **10%**，5 日累计上限 **30%**；
+- 等权 N=30 时，换掉一只股票约贡献 `1/30 ≈ 3.33%` 单边换手；10% 约可换 3 只；
+- 等权 N=10 时，换掉一只约贡献 `1/10=10%`；每日最多约换 1 只；
 - 预算按“分数改善/预计成本”排序使用；
 - 强制退出不受预算限制；
-- 若当日预算不足以完成所有合意调仓，剩余留到下一交易日，不追单；
-- 记录 `turnover_budget_used`、`deferred_swaps`。
+- 若当日预算不足，剩余留到下一交易日，不追单；若 5 日累计超 30%，次日上限降至 5%；
+- 记录 `turnover_budget_used`、`deferred_swaps`、`five_day_turnover`。
 
-成本感知：
+成本感知必须包含**最低佣金**：
 
 ```text
-turnover_delta = 0.5 * (|Δw_sell| + |Δw_buy|)          # 该 swap 的单边换手
-expected_cost_bps = turnover_delta * round_trip_cost_bps
-expected_alpha_bps = score_gain * alpha_bps_per_score   # alpha_bps_per_score 在训练集校准
+swap_amount = turnover_delta * equity              # 单边金额，买卖近似相等
+buy_amount = sell_amount = swap_amount
+commission_buy  = max(min_commission, buy_amount  * commission_rate)
+commission_sell = max(min_commission, sell_amount * commission_rate)
+stamp           = sell_amount * stamp_duty_sell
+transfer        = (buy_amount + sell_amount) * transfer_fee
+slippage        = (buy_amount + sell_amount) * slippage_rate
+round_trip_cost = commission_buy + commission_sell + stamp + transfer + slippage
+round_trip_cost_bps = round_trip_cost / swap_amount * 10000
+
+expected_alpha_bps = score_gain * alpha_bps_per_score
 accept_swap if score_gain >= min_score_improvement
-            and expected_alpha_bps >= expected_cost_bps * cost_hurdle_multiple
+            and expected_alpha_bps >= round_trip_cost_bps * cost_hurdle_multiple
 ```
 
-默认 `min_score_improvement=0.2`（z 分），`cost_hurdle_multiple=2`；`alpha_bps_per_score` 用训练窗口估计，并冻结到版本中。若样本不足、无法可靠校准，则第一版退化为只使用 `min_score_improvement` 硬阈值，成本只做展示和事后归因，不拍脑袋设定“1 分等于多少 bp”。
+默认 `min_score_improvement=0.2`（z 分），`cost_hurdle_multiple=2`；`alpha_bps_per_score` 用训练窗口估计，并冻结到版本中。若样本不足、无法可靠校准，则第一版退化为只使用 `min_score_improvement` 硬阈值，成本只做展示和事后归因，不拍脑袋设定“1 分等于多少 bp”。最低佣金会让 5,000 元级别的小单实际成本远高于 2.5 bp，这类 swap 应被成本门槛自然淘汰。
 
 #### 7.4.5 最小持有期
 
@@ -2033,17 +2349,32 @@ accept_swap if score_gain >= min_score_improvement
 ```text
 base_weight = (1 - cash_buffer) / N
 target_weight_i = base_weight * risk_exposure_multiplier
+max_weight = min(max_weight_abs, max(5%, 1.2 / N))
 ```
 
 - `risk_exposure_multiplier`：正常 1.0，回撤降档 0.5/0.0；
+- `N` 由 7.3.1 按 14:30 权益推导，不是固定 30；
 - 若行业/单票约束导致某些股票不能满仓，剩余留现金，不强行加给其他股票（避免超限）；
-- 单票上限 5% 高于等权 3.33%，主要用于容纳价格漂移；不主动超配。
+- 单票上限是动态的：N=10 约 12%，N=30 约 5%；它必须高于等权目标，否则无法建仓；
+- 单票上限主要用于容纳价格漂移和“一手容差”，不主动超配。
 
 #### 7.5.2 取整
 
 ```text
-target_shares_i = floor(target_weight_i * equity / price_i)
-target_shares_i = round_to_lot(target_shares_i, lot_rule)
+target_value_i = target_weight_i * equity
+raw_shares_i = floor(target_value_i / price_i)
+target_shares_i = round_to_lot(raw_shares_i, lot_rule)
+
+# 一手容差：目标不足一手，但一手金额不超过单票上限且现金允许
+if target_shares_i < lot_min_i and target_value_i > 0:
+    if price_i * lot_min_i <= max_weight * equity:
+        target_shares_i = lot_min_i
+    else:
+        target_shares_i = 0
+
+# 单票上限校验
+if target_shares_i * price_i > max_weight * equity:
+    target_shares_i = round_to_lot(floor(max_weight * equity / price_i), lot_rule)
 ```
 
 规则：
@@ -2051,14 +2382,17 @@ target_shares_i = round_to_lot(target_shares_i, lot_rule)
 - 主板/创业板：100 股整数倍；
 - 科创板：≥200 股，超过 200 可按 1 股递增；
 - 卖出：部分卖出数量 ≥ `min_qty` 且按步长；若卖出后剩余 < `min_qty`，优先全部卖出；全部卖出允许零股；
-- 取整后重新计算权重，检查单票/行业/现金；
+- 买入前必须满足 `price_i * lot_min_i <= max_weight * equity`；不满足的股票在候选阶段剔除，不生成“永远买不进”的订单；
+- 取整后重新计算权重，检查单票/行业/现金/最少持仓；
 - 买入总金额 + 费用 + 现金缓冲 ≤ 可用现金（含当日卖出回款）；
 - 不足则按“买入优先级”从低到高缩减，直到满足；
-- 残留现金保留，不强行凑整。
+- 残留现金保留，不强行凑整；
+- 若当前持仓低于一手容差但已持有，按实际持仓处理，不强制补齐。
 
 #### 7.5.3 现金计划
 
 ```text
+cash_start = account_snapshot.available_cash_cents   # 与台账校验后
 cash_available = cash_start + proceeds_from_sells - sell_fees
 cash_needed = buys + buy_fees + cash_buffer
 if cash_needed > cash_available:
@@ -2066,6 +2400,7 @@ if cash_needed > cash_available:
 ```
 
 - 先卖后买；卖出回款当日可用于买入（A 股交易资金可用）；
+- `cash_start` 以 14:20 券商账户快照为准；快照与台账不一致时先阻断，不用台账硬算；
 - 不用“T+1 资金不可用”的错误假设；但提现 T+1 不建模；
 - 费用按费率表估算，留 2% 缓冲；
 - 任何情况下现金不得为负；回测/实盘都断言。
@@ -2098,7 +2433,7 @@ if cash_needed > cash_available:
 
 生成订单前逐只检查：
 
-- 在股票池且 `eligible`；
+- `buy_eligible=True`（新买/加仓）；
 - 买入：`can_buy=True`，非涨停/停牌/ST/新股/退市/冲突；
 - 卖出：`can_sell=True`，非跌停/停牌，`available_qty` 足够；
 - 价格在涨跌停之间；
@@ -2166,65 +2501,76 @@ NEW -> RISK_APPROVED -> PUSHED -> SENT_TO_MANUAL -> PARTIAL/FILLED
 
 ## 8. 回测执行器
 
-### 8.1 选型：Backtrader
+### 8.1 选型：自研 A 股回放引擎
 
 #### 8.1.1 结论
 
-**选择 Backtrader 作为第一版官方回测执行器**，采用“**信号预计算 + 订单级执行回放**”架构；不选 vnpy 作为第一版回测核心。
+**第一版不依赖 Backtrader/vnpy，直接实现 `AShareReplayEngine`（A 股事件回放循环）**。原因不是“重复造轮子”，而是本系统的回测已经被拆成“**信号离线预计算 + 订单执行回放**”，第三方框架只剩订单/记账这一小段；而 A 股的 T+1、涨跌停、停牌、整手、公司行为、弱成交匹配又必须深度定制。此时框架带来的抽象收益很低，限制和调试成本反而更高。
 
 #### 8.1.2 对比
 
-| 维度 | Backtrader | vnpy |
-|---|---|---|
-| 定位 | 事件驱动回测/交易框架 | 交易平台（回测+实盘网关+GUI） |
-| A 股股票日频 | 轻量、可定制 broker/费用/滑点 | 更偏期货/CTP，股票网关依赖券商 |
-| 自定义 T+1/涨跌停/整手 | 需要自写 broker/规则，但可控 | 同样需要自写，且框架更重 |
-| 实盘接入 | 非重点；本系统人工执行，不需要 | 强项，但第一版不需要 |
-| 依赖/运维 | 纯 Python，轻 | 组件多，学习/维护成本高 |
-| 性能 | 多标的 feed 较慢，需控制标的数 | 事件引擎，适合实时，回测性能也需优化 |
-| 维护状态 | 成熟稳定，社区维护节奏较慢 | 活跃，但 API/生态偏交易平台 |
+| 维度 | Backtrader | vnpy | 自研 `AShareReplayEngine` |
+|---|---|---|---|
+| 定位 | 通用事件驱动回测框架 | 交易平台（回测+实盘网关+GUI） | 本系统专用日频/5 分钟回放 |
+| 信号计算 | 通常在 `next()` 中，或外挂 | 事件引擎内 | 完全离线预计算，回测只消费目标/订单 |
+| A 股规则 | 需自定义 broker/feed/filler | 需自定义，框架更重 | 规则原生，和实盘共用同一套引擎 |
+| T+1/整手/停牌/涨跌停 | 非原生，需绕过默认行为 | 非原生 | 一等公民，显式状态机 |
+| 成交撮合 | 需改 broker，细节不透明 | 需改引擎 | 逐 bar 显式撮合，可打印每个判定 |
+| 多标的数据 | 多 feed 性能/内存压力 | 事件引擎开销 | 只加载目标/持仓/基准并集，按日切片 |
+| 金额精度 | float 记账，需额外处理 | 视实现 | 整数分/Decimal 记账 |
+| 弱成交匹配 | 不涉及 | 不涉及 | 原生支持无 `client_order_id` 的成交匹配 |
+| 维护成本 | 框架维护慢，升级风险 | 组件多、学习成本高 | 代码自持，测试覆盖要求高 |
+| 适用性 | 通用策略原型 | 期货/实盘网关 | 本系统日频人工执行 |
 
 #### 8.1.3 理由
 
-1. 本系统是日频、TopN、人工执行，不需要 vnpy 的实盘网关；
-2. Backtrader 的 `Broker`/`Commission`/`Slippage`/`Analyzer` 扩展点足够；
-3. 纯 Python、依赖少，适合单机；
-4. 通过“信号预计算 + 只喂候选/持仓股票”规避多标的性能问题；
-5. 用 `BacktestEngine` 接口隔离，未来若需 vnpy/QMT 实盘，可替换执行层而不改信号层。
+1. 因子/组合/目标权重已经在回测前算完，回测只做“给定订单，模拟成交和记账”；
+2. 自研循环可以直接复用实盘的 `LimitRuleEngine`、`LotRule`、`FeeSchedule`、`T1Ledger`、`OrderStateMachine`，避免“回测一套、实盘一套”；
+3. 不需要为了 T+1/涨跌停/停牌/整手/公司行为去和第三方 broker 的默认行为搏斗；
+4. 不需要引入 Backtrader 的多 feed/元类/事件体系，也不需要 vnpy 的网关/GUI；
+5. 回放是确定性的：同一输入、同一规则版本、同一订单序列，输出完全一致，便于逐笔审计；
+6. 未来若接入自动交易，只需新增 `ExecutionAdapter`，不推翻回测引擎。
 
 #### 8.1.4 风险与缓解
 
 | 风险 | 缓解 |
 |---|---|
-| Backtrader 不原生支持 T+1/涨跌停/整手/停牌 | 自定义 `AShareBroker` + `ExecutionModel` + 单元测试 |
-| 多标的 feed 慢 | 信号离线预计算；只加载目标/持仓/基准的并集 |
-| 公司行为不原生 | `CorporateActionProcessor` 在每日开盘前调整持仓/现金 |
-| 浮点现金误差 | 台账用 Decimal 记账；回测结束与 broker 对账 |
-| 框架维护慢 | 锁定版本；适配层隔离；关键规则自测 |
-| 5 分钟数据历史不足 | 明确回测区间；不足则不用日线冒充，缩短样本或使用研究模式并标注 |
+| 自研撮合/记账有 bug | 规则表驱动 + 单元测试 + 属性测试 + 黄金用例 |
+| 回测与实盘行为漂移 | 共用 `Order`/`Fill`/`Fee`/`Lot`/`Limit` 模块；定期回放真实成交 |
+| 性能不如向量化 | 只回放目标/持仓并集；日频/5 分钟数据量可控；必要时按日并行 |
+| 复杂公司行为 | 先支持现金分红/送转/拆股；配股人工处理；逐项测试 |
+| 弱成交匹配歧义 | 显式 `match_status`，歧义不自动分配，进入人工复核 |
+| 回测样本长导致数据质量差 | 长历史用 `daily-research`；近期用 `production-replay` 校准执行 |
 
 ### 8.2 回测架构
 
 ```text
 PIT 数据
-  -> UniverseBuilder（历史池）
+  -> UniverseBuilder（历史池：buy_eligible / hold_eligible / exit_required）
   -> FactorEngine（缓存）
   -> CompositeScorer
-  -> PortfolioBuilder（每日目标权重）
-  -> TargetPortfolio 序列（信号预计算）
-  -> BacktestRunner
-       -> AShareBroker（现金/持仓/T+1/费用）
-       -> ExecutionModel（涨跌停/停牌/整手/部分成交）
-       -> Feeds（目标/持仓/基准的并集，5 分钟或日线）
-  -> Analyzer/Report
+  -> PortfolioBuilder（每日目标权重，资金规模推导 N）
+  -> TargetPortfolio 序列
+  -> OrderGenerator（可交易性/整手/限价/换手）
+  -> AShareReplayEngine
+       -> AccountSnapshot（期初现金/持仓）
+       -> CorporateActionProcessor（开盘前）
+       -> T1Ledger.roll（T+1 可用数量）
+       -> OrderBook（NEW/ACCEPTED/PARTIAL/FILLED/EXPIRED/REJECTED）
+       -> MatchingEngine（停牌/涨跌停/整手/参与率/滑点）
+       -> FeeModel + CashLedger + PositionLedger（整数分）
+       -> EndOfDay（未成交过期、市值、权益）
+  -> Metrics / Attribution / Report
 ```
 
 关键点：
 
-- **信号预计算**：因子/组合不在 Backtrader 的 `next()` 里算，避免性能问题和前视风险；
-- **执行回放**：Backtrader 只负责“给定目标/订单，模拟成交和记账”；
+- **信号预计算**：因子/组合不在回放循环里算；循环只处理订单和成交；
+- **事件顺序固定**（production-replay）：开盘前公司行为 -> T+1 可用数量滚动 -> 14:30 注入订单 -> 14:35 起逐 bar 撮合 -> 14:55 未成交过期 -> 收盘估值；`daily-research` 则在开盘注入订单并按 T+1 开盘价撮合；
 - **同一套规则**：`LimitRuleEngine`、`LotRule`、`FeeSchedule`、`T1Ledger` 与实盘共用；
-- **可重放**：输入 `TargetPortfolio` 序列 + 行情 + 规则版本，输出确定。
+- **金额精度**：现金/价格/费用用整数分（或 Decimal），不用 float；
+- **可重放**：输入 `TargetPortfolio` 序列 + 行情 + 规则版本 + 配置哈希，输出确定；
+- **模式隔离**：`daily-research` 与 `production-replay` 使用不同的信号时点/成交价假设，报告必须标注，不能混合。
 
 ### 8.3 A 股成交规则
 
@@ -2280,36 +2626,63 @@ class T1Ledger:
 - 取整导致的现金残留保留；
 - 科创板 200 股起、1 股递增；主板/创业板 100 股整数倍。
 
-#### 8.3.5 部分成交
+#### 8.3.5 部分成交与参与率
 
-- 订单在 14:30 提交，允许在 14:35–14:55 的 5 分钟 bar 中分批成交；
-- 每根 bar 的成交量上限 = `bar.volume * participation_rate`（默认 1%）；
+- 订单在 14:30 注入，允许在 14:35–14:55 的 5 分钟 bar 中分批成交；
+- **小额订单豁免**：若订单金额 ≤ `0.1% × ADV20`，视为小资金订单，不做 bar 成交量比例限制，按 bar 价格全额成交（仍受涨跌停/停牌/整手/bar 实际成交量约束；若订单量 > bar.volume，按 bar.volume 成交，剩余继续）；
+- **大额订单**：若订单金额 > `0.1% × ADV20`，每根 bar 的成交量上限 = `bar.volume × participation_rate`，默认 `participation_rate=10%`；
+- 订单金额 > `1% × ADV20` 在事前风控阶段直接拒绝/缩量，不进入撮合；
 - 剩余数量继续挂到下一 bar，14:55 未成交部分过期；
 - 不因为部分成交而生成新信号；
-- 回测输出每笔 fill 和订单剩余。
+- 回测输出每笔 fill、订单剩余、未成交原因。
+
+> 原设计用 `1%` 参与率会把小资金订单也系统性砍成部分成交，导致回测换手/收益失真。小资金订单本身远小于市场成交量，应优先按“可成交”处理；只有相对 ADV 较大的订单才需要参与率约束。
 
 #### 8.3.6 订单价格与成交价
 
-保守规则：
+**先定义价格口径，避免“14:30 的 close”歧义：**
+
+| 价格 | 定义 | 用途 |
+|---|---|---|
+| `close_d` | T-1 日最后一个完整交易日的收盘价 | 日频因子、动量、WQ101 |
+| `last_1430` | T 日 14:30 快照最新价 | 实盘决策价、限价基准、TCA |
+| `fill_live` | 券商实际成交价 | 实盘记账/归因 |
+| `fill_prod` | `production-replay` 的 14:35 bar 成交价 | 近期执行校准 |
+| `fill_daily` | `daily-research` 的 T+1 开盘成交价 | 长历史研究 |
+
+**成交价规则：**
 
 ```text
-买入限价 L：
-  if bar 一字涨停 or 无成交: 不成交
-  elif bar.open <= L: 成交价 = min(L, bar.open + slippage)  # 开盘更优
-  elif bar.low <= L: 成交价 = L + slippage
-  else: 不成交
+production-replay（14:30 信号，14:35 起撮合）：
+  决策价 = last_1430
+  最早可成交 bar = 14:35 bar
+  买入限价 L：
+    if 一字涨停/停牌/无成交: 不成交
+    elif bar.open <= L: 成交价 = min(L, bar.open + slippage)
+    elif bar.low <= L: 成交价 = L + slippage
+    else: 不成交
+  卖出限价 L：
+    if 一字跌停/停牌/无成交: 不成交
+    elif bar.open >= L: 成交价 = max(L, bar.open - slippage)
+    elif bar.high >= L: 成交价 = L - slippage
+    else: 不成交
 
-卖出限价 L：
-  if bar 一字跌停 or 无成交: 不成交
-  elif bar.open >= L: 成交价 = max(L, bar.open - slippage)
-  elif bar.high >= L: 成交价 = L - slippage
-  else: 不成交
+daily-research（T-1 收盘信号，T+1 开盘成交）：
+  决策价 = close_d（T-1）
+  成交价 = T+1 open + slippage（买入）/ T+1 open - slippage（卖出）
+  受 T+1 涨跌停/停牌约束；不要求 5 分钟数据
+
+live（人工执行）：
+  决策价 = last_1430
+  成交价 = 券商实际成交价
+  限价单不得超出调仓单限价/涨跌停
 ```
 
 - 成交价必须落在 `[bar.low, bar.high]` 和 `[limit_down, limit_up]`；
 - 滑点方向始终对策略不利；
 - 不用收盘价“偷价”；
-- 日线模式只能近似，必须标注；官方回测优先 5 分钟模式。
+- `production-replay` 与 `daily-research` 的报告必须标注模式，禁止把两种成交价混在同一个净值曲线里；
+- 小额订单按 8.3.5 全额成交；大额订单按参与率部分成交。
 
 #### 8.3.7 公司行为
 
@@ -2332,27 +2705,30 @@ class T1Ledger:
 
 - 佣金、印花税、过户费按 5.5.3 的日期规则；
 - 滑点默认 5 bp，按成交金额计；
-- 无市场冲击；参与率上限 1% ADV20；
+- 无市场冲击模型；小资金订单（≤0.1% ADV20）按 bar 价全额成交，大额订单按 10% bar 成交量参与；
+- 单笔订单金额上限 1% ADV20，超过则事前拒绝/缩量；
+- 最低佣金 5 元必须进入换手成本：小额订单的实际费率可能远高于 2.5 bp，不能只用比例佣金估算；
 - 回测输出毛收益/净收益/费用明细；
-- 敏感性分析：滑点 0/5/10/20 bp，佣金 1/2.5/3 bp，印花税按历史；
-- 小资金假设：单笔订单通常远小于 1% ADV；若回测资金放大，必须重新评估容量。
+- 敏感性分析：滑点 0/5/10/20 bp，佣金 1/2.5/3 bp，最低佣金 0/5/10 元，印花税按历史；
+- 小资金假设：单笔订单通常远小于 0.1% ADV；若回测资金放大，必须重新评估容量和参与率。
 
 ### 8.5 回测流程
 
 ```text
 1. 读取配置/规则版本/数据 manifest
-2. 构建历史股票池（逐日）
+2. 构建历史股票池（buy_eligible / hold_eligible / exit_required）
 3. 计算/读取因子 panel（缓存）
 4. 合成 score
-5. 逐日构建目标组合（只用 as_of 数据）
-6. 生成 TargetPortfolio 序列
+5. 逐日构建目标组合（只用 as_of 数据；N 由资金规模推导）
+6. 生成 TargetPortfolio / Order 序列
 7. 加载回测标的并集（目标/持仓/基准）
-8. 初始化 AShareBroker/现金/持仓
-9. 逐 bar/逐日：
+8. 初始化 AShareReplayEngine/现金/持仓
+9. 逐日/逐 bar：
    a. 处理公司行为
    b. 处理 T+1 roll
-   c. 执行前一日/当日 14:30 订单
-   d. 更新市值/权益
+   c. 14:30 注入订单（production）或开盘注入（daily-research）
+   d. 按成交价策略撮合、部分成交、过期
+   e. 更新市值/权益
 10. 每日收盘记录 equity/positions/orders/fills
 11. 计算指标/归因/报告
 12. 与独立台账对账（现金、持仓、订单）
@@ -2360,13 +2736,19 @@ class T1Ledger:
 
 模式：
 
-| 模式 | 数据 | 信号时点 | 成交 | 用途 |
+| 模式 | 数据 | 信号时点 | 成交 | 样本/用途 |
 |---|---|---|---|---|
-| `production-replay` | 日线 + 5 分钟 | T 14:30 | 14:35–14:55 5 分钟 bar | 官方回测 |
-| `daily-research` | 日线 | T-1 收盘 | T 收盘/次日开盘 | 快速研究，非官方 |
-| `intraday-only` | 5 分钟 | 14:30 | 14:35–14:55 | 日内因子验证 |
+| `daily-research` | 日线（不需 5 分钟） | T-1 收盘 | T+1 开盘 + 滑点 | **2015 年起的长历史研究基线**；因子/组合/风格/容量初筛 |
+| `production-replay` | 日线 + 5 分钟 | T 14:30 | 14:35 bar + 滑点 | **近 2–3 年执行校准**；验证 14:30 信号、成交价、部分成交、滑点 |
+| `intraday-only` | 5 分钟 | 14:30 | 14:35–14:55 | 日内因子验证，不用于长历史结论 |
 
-`daily-research` 必须在报告中标注“与实盘时间轴不一致”，不得用于对外/实盘决策。
+使用规则：
+
+- **长历史结论以 `daily-research` 为主**：2015 年起，覆盖多轮牛熊，至少可做多折 walk-forward；
+- **`production-replay` 只用于近期执行校准**：5 分钟数据不足时，不强行用它做长历史结论；
+- **日内因子**只能用 `production-replay`/`intraday-only` 的近期样本评测，不能把日频长历史结论套到日内因子；
+- 两类回测的报告必须分开命名、分开图表、分开结论；不得把 `daily-research` 的收益和 `production-replay` 的滑点拼成一条“官方净值”；
+- `daily-research` 必须标注“信号在 T-1 收盘、T+1 开盘成交”，与实盘 14:30 时间轴不同；它用于研究，不用于宣称实盘可实现收益。
 
 ### 8.6 回测指标
 
@@ -2402,17 +2784,19 @@ turnover_daily = 0.5 * sum(abs(w_t - w_{t-1}))
 ### 8.7 验证方法
 
 1. **样本外**：训练/验证/测试时间切分；参数只在训练集确定；
-2. **Walk-forward**：滚动训练 3 年、验证 1 年、测试 1 年；purge 20 天、embargo 5 天，避免重叠收益泄漏；
-3. **前视审计**：future injection / shift test；
-4. **生存者偏差**：包含退市股；与“当前成分”版本对比，量化偏差；
-5. **规则测试**：T+1、涨跌停、停牌、整手、费用、除权的已知答案测试；
-6. **参数敏感性**：N、buffer、换手上限、滑点、信号时间（14:30/14:45）；
-7. **子样本**：牛市/熊市/震荡、不同板块、不同市值/流动性分组；
-8. **多重检验**：Deflated Sharpe、BHY/Bonferroni；记录尝试过的因子/参数数量；
-9. **成本敏感性**：0/5/10/20 bp 滑点，佣金上浮；
-10. **执行延迟**：14:30 vs 14:40 vs 14:50，评估信号衰减；
-11. **容量**：资金 100 万/500 万/1000 万，订单/ADV 比例；
-12. **独立复算**：用另一套简单向量化脚本复算收益，和 Backtrader 对账。
+2. **长历史 Walk-forward**：用 `daily-research` 从 2015 年起，滚动训练 3 年、验证 1 年、测试 1 年；purge 20 天、embargo 5 天，避免重叠收益泄漏；2015–2026 应至少形成 5–7 折，而不是只够一折；
+3. **近期执行校准**：用 `production-replay`（5 分钟数据可得的近 2–3 年）验证 14:30 信号、14:35 成交价、部分成交、滑点；不把近期校准结果冒充长历史结论；
+4. **前视审计**：future injection / shift test；
+5. **生存者偏差**：包含退市股；与“当前成分”版本对比，量化偏差；
+6. **规则测试**：T+1、涨跌停、停牌、整手、费用、除权、2026-07-06 ST 规则切换的已知答案测试；
+7. **参数敏感性**：N、buffer、换手上限、滑点、信号时间（14:30/14:45）、资金规模（15 万/30 万/100 万）；
+8. **子样本**：牛市/熊市/震荡、不同板块、不同市值/流动性分组；
+9. **多重检验**：Deflated Sharpe、BHY/Bonferroni；记录尝试过的因子/参数数量；
+10. **成本敏感性**：0/5/10/20 bp 滑点，佣金 1/2.5/3 bp，最低佣金 0/5/10 元；
+11. **执行延迟**：14:30 vs 14:40 vs 14:50，评估信号衰减；
+12. **容量**：资金 15 万/30 万/100 万/500 万，订单/ADV 比例、最小整手可买性；
+13. **5 分钟数据不足**：明确缩短 `production-replay` 区间；不得用日线数据伪造 14:35 成交；
+14. **独立复算**：用另一套简单向量化/逐笔脚本复算收益，和 `AShareReplayEngine` 对账。
 
 ### 8.8 回测输出
 
@@ -2421,6 +2805,7 @@ reports/backtest/{run_id}/
 ├── summary.md
 ├── metrics.json
 ├── config.yaml
+├── run_manifest.json      # mode/data_as_of/fill_policy/rule_version
 ├── data_manifest.json
 ├── equity.parquet
 ├── positions.parquet
@@ -2444,7 +2829,8 @@ reports/backtest/{run_id}/
 - 数据 manifest 哈希；
 - 因子版本集合；
 - 规则表版本；
-- 回测起止、模式、基准；
+- 回测起止、模式（daily-research/production-replay）、基准；
+- `fill_policy`（T+1_open / 14:35_bar_open / broker_actual）；
 - 随机种子（如有）；
 - Python/依赖版本。
 
@@ -2457,13 +2843,14 @@ reports/backtest/{run_id}/
 | 组件 | 职责 |
 |---|---|
 | `SignalJob` | 14:30 采集快照、构建股票池、计算因子、打分、组合、订单 |
+| `AccountSnapshotService` | 14:20/收盘后抓取/校验券商账户快照，缺失则 NO_TRADE |
 | `RiskGate` | 数据/现金/换手/单票/行业/回撤/对账门禁 |
 | `OrderSheetGenerator` | 生成 CSV/Markdown/飞书卡片 |
 | `Notifier` | 飞书/企微/邮件推送、重试、告警 |
 | `ManualExecutor` | 记录人工执行状态、确认、备注；不自动下单 |
-| `FillIngestor` | 导入/录入交割单，校验、幂等、更新订单 |
+| `FillIngestor` | 导入当日成交查询/T+1 对账单，弱匹配、幂等、更新订单 |
 | `PositionService` | 持仓、现金、成本、T+1 可用数量 |
-| `Reconciler` | 订单-成交-持仓-现金-券商对账 |
+| `Reconciler` | PRELIM/FORMAL 对账：订单-成交-持仓-现金-账户快照-券商对账单 |
 | `Attribution` | PnL/行业/因子/执行归因 |
 | `Scheduler` | 定时任务、重试、状态机、超时告警 |
 
@@ -2476,21 +2863,22 @@ class ExecutionAdapter(Protocol):
     def submit(self, order: Order) -> Ack: ...
     def cancel(self, client_order_id: str) -> Ack: ...
     def poll_fills(self, since: datetime) -> list[Fill]: ...
+    def account_snapshot(self) -> AccountSnapshot | None: ...
     def positions(self) -> list[Position]: ...
     def cash(self) -> CashSnapshot: ...
 ```
 
 | 实现 | 行为 |
 |---|---|
-| `BacktestExecutionAdapter` | 把订单交给 `AShareBroker`，按 5 分钟/日线规则模拟成交，返回 `Fill` |
-| `ManualExecutionAdapter` | 把订单写入调仓单并等待人工执行；`poll_fills` 读取已导入的交割单；不自动下单 |
+| `ReplayExecutionAdapter` | 把订单交给 `AShareReplayEngine`，按 5 分钟/日线规则模拟成交，返回 `Fill`；`account_snapshot` 返回模拟期初快照 |
+| `ManualExecutionAdapter` | 把订单写入调仓单并等待人工执行；`account_snapshot` 读取 14:20 快照；`poll_fills` 读取当日成交查询/T+1 对账单；不自动下单 |
 
 约束：
 
 - `ExecutionAdapter` 只负责“订单 -> 成交/持仓/现金”，不计算因子/目标组合；
 - 回测和实盘的订单字段、状态机、费用口径一致；
 - 人工执行器不能在未导入成交的情况下“猜测”成交；
-- 所有 `Fill` 必须可追溯到 `client_order_id` 和 `broker_trade_id`（或手工 ID）。
+- 所有 `Fill` 必须可追溯到 `broker_trade_id` / `broker_order_id` / `raw_hash`；`client_order_id` 允许为空，但匹配状态必须记录。
 
 ### 9.2 信号推送（飞书）
 
@@ -2499,12 +2887,12 @@ class ExecutionAdapter(Protocol):
 飞书卡片建议包含：
 
 - 标题：`QuantX 调仓信号 | 2026-11-13 | v1`
-- 账户：总资产、可用现金、当前仓位、目标仓位；
-- 风险：回撤等级、暴露乘数、数据质量、对账状态；
+- 账户：总资产、可用现金、当前仓位、目标仓位；账户快照时间/状态；
+- 风险：回撤等级、暴露乘数、数据质量、PRELIM/FORMAL 对账状态；
 - 交易：买入 N 只、卖出 M 只、预计换手、预计费用、预计现金；
 - Top 5 买入/卖出（代码、名称、数量、限价、原因）；
 - 执行窗口：14:35–14:55；
-- 截止：15:05 前录入交割单；
+- 截止：15:05 前录入当日成交查询；T+1 09:30 前导入正式对账单；T+1 10:00 前完成正式对账；
 - 链接/附件：调仓单 CSV、信号报告；
 - 风险提示：人工复核，不构成投资建议。
 
@@ -2531,25 +2919,29 @@ class Notifier(Protocol):
 - 交易员在飞书回复“已收到/开始执行”，或运行 `quantx live ack --run-id ...`；
 - 14:40 未 ack -> P1 提醒；14:45 未 ack -> P0；
 - ack 只表示收到，不代表成交；
-- 执行完成后必须录入交割单，不能只发消息。
+- 执行完成后必须录入当日成交查询，T+1 正式对账单不能只发消息。
 
 ### 9.3 事前风控
 
 | 检查 | 规则 | 失败动作 | 级别 |
 |---|---|---|---|
-| 数据新鲜度 | 快照 ≤ 14:30:30；日线齐全 | BLOCK | P0 |
-| 数据一致性 | 多源冲突率/关键字段 | BLOCK | P0 |
-| 股票池 | 非空、可交易比例 ≥ 80% | BLOCK/WARN | P0/P1 |
-| 对账状态 | 上一交易日无 FAIL | BLOCK | P0 |
-| 现金 | 买入+费用+缓冲 ≤ 可用现金 | BLOCK | P0 |
+| 账户快照 | 14:20 快照存在、≤15 分钟、账户/日期/资产/持仓清晰 | BLOCK | P0 |
+| 快照一致性 | 快照 vs 内部台账：数量 0 差、现金 ≤0.01 元 | BLOCK | P0 |
+| 最低资金 | `equity >= 150,000` | BLOCK（只允许模拟盘） | P0 |
+| 数据新鲜度 | 行情快照 ≤ 14:30:30；关键日线齐全 | BLOCK | P0 |
+| 数据一致性 | 持仓 + Top 2N + 订单关键字段无冲突 | BLOCK | P0 |
+| 正式对账 | 上一交易日 FORMAL 已完成且非 FAIL | BLOCK | P0 |
+| 现金 | 买入+费用+缓冲 ≤ 快照可用现金 + 当日卖出回款 | BLOCK | P0 |
 | 卖出可用 | 卖出 ≤ `available_qty`（T+1） | 调整/拒绝 | P0 |
-| 换手 | 单日单边 ≤ 20% | 缩减/延后 | P1 |
-| 单票 | 目标权重 ≤ 5% | 缩减 | P1 |
+| 换手 | 单日单边 ≤ 10%；5 日累计 ≤ 30% | 缩减/延后 | P1 |
+| 单票 | 目标权重 ≤ `min(15%, max(5%,1.2/N))` | 缩减 | P1 |
 | 行业 | 目标行业 ≤ 20% | 缩减/替换 | P1 |
-| 持仓数 | ≥ 20 | BLOCK/WARN | P1 |
+| 持仓数 | ≥ `max(5, floor(0.8*N))` | BLOCK/WARN | P1 |
+| 整手可买 | `one_lot_value <= max_weight * equity` | 剔除 | P1 |
 | 流动性 | 订单 ≤ 1% ADV20 | 缩量/拒绝 | P1 |
 | 涨跌停 | 买入非涨停、卖出非跌停 | 跳过/挂起 | P1 |
-| 停牌/ST/新股/退市 | 不可买；持仓可卖则卖 | 跳过/强制退出 | P1/P0 |
+| 停牌/ST/新股/退市 | 不可买；持仓按 `exit_required` 处理 | 跳过/强制退出/挂起 | P0/P1 |
+| 证券阻挡 | `security_blocklist` 硬阻断 | 拒绝 | P0 |
 | 价格偏离 | 限价与参考价偏离 ≤ 3% | 拒绝 | P1 |
 | 重复订单 | 同股票同方向同版本唯一 | 去重 | P0 |
 | 回撤 | 按等级降暴露 | 降仓/只卖不买 | P0/P1 |
@@ -2608,6 +3000,8 @@ class Notifier(Protocol):
 
 #### 9.5.1 执行前
 
+- 14:20 前抓取券商账户快照（总资产、可用资金、持仓、可用数量），上传 CSV/截图并校验；
+- 没有有效快照，或快照与内部台账数量/现金不一致 -> **NO_TRADE**，不推送可执行订单；
 - 收到飞书卡片，打开调仓单；
 - 核对：日期、账户、现金、持仓、买卖方向、数量、限价；
 - 确认无停牌/涨跌停/除权异常；
@@ -2626,18 +3020,25 @@ class Notifier(Protocol):
 
 #### 9.5.3 执行后
 
-- 15:05 前录入交割单；
-- 录入字段：`broker_trade_id, client_order_id, trade_date, code, side, qty, price, commission, stamp_duty, transfer_fee, executed_at, note`；
+- **15:05 前**从券商 App“当日成交查询”录入/导入成交；这是初步对账依据，不是正式交割单；
+- **T+1 09:30 前**导入券商正式对账单/交割单；正式对账以它为准；
+- 录入字段：`broker_trade_id, broker_order_id, client_order_id, statement_id, trade_date, code, side, qty, price, commission, stamp_duty, transfer_fee, executed_at, note`；
+- `client_order_id` **允许为空**：很多券商交割单没有客户订单号；系统用 `broker_trade_id`/`broker_order_id`/复合键匹配；
 - 支持 CSV 导入和 CLI 手工录入；
-- 支持一笔订单多笔成交（部分成交）；
+- 支持一笔订单多笔成交（部分成交），也支持一笔成交匹配多笔订单的分配；
 - 校验：
-  - 订单存在且方向一致；
+  - 订单/成交方向一致；
   - 累计成交量 ≤ 订单量；
   - 价格在涨跌停内、在合理偏离内；
   - 费用非负；
   - 成交时间在交易时段；
-  - `broker_trade_id` 唯一，幂等；
-- 校验失败 -> 拒绝导入，提示具体行/字段；
+  - `broker_trade_id` 或 `raw_hash` 唯一，幂等；
+- 匹配结果：
+  - `MATCHED`：找到唯一订单；
+  - `UNMATCHED`：暂未找到订单，保留成交，进入人工分配；
+  - `AMBIGUOUS`：多个候选订单，保留成交，不自动分配；
+- 不允许因为缺 `client_order_id` 直接拒收成交；拒收会导致持仓/现金错账；
+- 校验失败 -> 拒绝该行并提示具体字段；匹配失败 -> 收下成交但标记，进入对账差异；
 - 导入成功后更新订单状态、持仓、现金、T+1 可用数量；
 - 未成交订单标记 `EXPIRED`，不自动顺延。
 
@@ -2649,43 +3050,68 @@ class Notifier(Protocol):
 - 手工录入与 CSV 导入同一校验逻辑；
 - 不允许直接改数据库持仓；必须通过成交/公司行为/现金流事件。
 
-### 9.6 对账
+### 9.6 对账（PRELIM / FORMAL）
 
-#### 9.6.1 三方对账
+#### 9.6.1 四路对账与两个阶段
 
 ```text
 内部订单/成交（系统）
         vs
-券商对账单/成交回报（人工导出）
+T 日券商 App 当日成交查询（人工导出/录入）
         vs
-行情市值/公司行为（数据层）
+T+1 券商正式对账单/交割单（人工导出）
+        vs
+行情市值/公司行为/账户快照（数据层）
 ```
 
-时点安排：
+| 阶段 | 时点 | 数据 | 目的 |
+|---|---|---|---|
+| PRELIM | T 15:30 | 当日成交查询 + 收盘账户快照 + 内部台账 | 尽早发现漏录/数量/现金异常 |
+| FORMAL | T+1 10:00 | 券商正式对账单/交割单 + 内部台账 + 行情 | 最终确认持仓/现金/费用，关闭或阻断 |
 
-- 15:30 初步对账可基于已录入成交与券商 App 成交记录，用于尽早发现漏录；
-- 16:30 正式对账必须以券商对账单/成交回报为准；
-- 若券商对账单延迟，正式对账顺延，且次日信号默认 BLOCK，直到对账完成；
-- 不允许用“内部台账自洽”代替券商对账。
+- **券商正式对账单通常 T+1 才能拿到**，16:30 完成正式对账不现实；设计默认 T+1 正式对账；
+- 如果券商当晚就提供正式对账单，可以提前跑 FORMAL；但不得用“App 页面截图”冒充正式对账单；
+- T+1 13:00 前未完成 FORMAL 或 FORMAL FAIL -> T+1 14:30 NO_TRADE；
+- PRELIM 只做数量/价格/现金粗校验；费用/佣金差异可标记 `PENDING_FORMAL`，不作为 P0；FORMAL 必须闭环；
+- 不允许用“内部台账自洽”代替券商对账；
+- 券商对账单**不一定有 `client_order_id`**，匹配不能依赖它。
 
-#### 9.6.2 对账步骤
+#### 9.6.2 对账步骤与弱成交匹配
 
-1. 归一化券商对账单（字段、代码、方向、费用）；
-2. 按 `broker_trade_id` 匹配成交；无 ID 时用 `(date, code, side, qty, price, time)` 近似匹配，并标记；
-3. 检查订单-成交：无孤儿成交、无超量成交、无方向错误；
-4. 从昨日持仓 + 今日成交 + 公司行为重建持仓；
-5. 对比内部持仓 vs 券商持仓：数量、可用数量、成本；
-6. 对比现金：`期末现金 = 期初现金 + 卖出成交额 - 买入成交额 - 佣金 - 印花税 - 过户费 + 现金分红 + 其他公司行为现金流`；
-7. 对比市值：数量 × 收盘价；
-8. 生成差异列表、严重级别、处理建议；
-9. 硬差异未关闭 -> 次日信号 BLOCK。
+1. 归一化券商对账单（字段、代码、方向、费用、成交时间、`broker_order_id`）；
+2. 每笔成交写入 `fills`，计算 `raw_hash` 幂等；`client_order_id` 可为空；
+3. 成交匹配按优先级：
+   1. `broker_trade_id` 精确匹配；
+   2. `broker_order_id` + `(trade_date, code, side)` 匹配；
+   3. 复合键 `(trade_date, code, side, qty, price, executed_at)`，价格容差 0.01 元、时间容差 5 分钟；
+   4. 仍无唯一结果 -> `AMBIGUOUS`，不自动分配；人工指定 `client_order_id` 或按 FIFO 分配并记录；
+4. 检查订单-成交：无孤儿成交、无超量成交、无方向错误；
+5. 从昨日持仓 + 今日成交 + 公司行为重建持仓；
+6. 对比内部持仓 vs 券商持仓：数量、可用数量、成本；
+7. 对比现金：`期末现金 = 期初现金 + 卖出成交额 - 买入成交额 - 佣金 - 印花税 - 过户费 + 现金分红 + 其他公司行为现金流`；
+8. 对比市值：数量 × 收盘价；
+9. 对比账户快照：总资产、可用资金、持仓数量；
+10. 生成差异列表、严重级别、处理建议；
+11. 硬差异未关闭 -> 次日信号 BLOCK。
+
+弱匹配原则：
+
+- 缺 `client_order_id` 是常态，不能因此拒收成交；
+- 不能凭空生成 `client_order_id`；只能标记 `UNMATCHED`/`AMBIGUOUS`；
+- 一笔成交可拆给多笔订单，一笔订单也可对应多笔成交；分配必须记录 `match_method` 和操作者；
+- 任何人工分配进入审计日志，不能静默修改；
+- FORMAL 通过的条件：所有成交 `MATCHED`，或 `UNMATCHED/AMBIGUOUS` 已人工分配并记录。
 
 #### 9.6.3 差异分类
 
 | 差异 | 说明 | 级别 | 处理 |
 |---|---|---|---|
-| `MISSING_FILL` | 券商有成交，系统无 | P0 | 补录 |
+| `MISSING_FILL` | 券商有成交，系统无/未导入 | P0 | 补录 |
 | `ORPHAN_FILL` | 系统有成交，券商无 | P0 | 核查/撤销 |
+| `UNMATCHED_FILL` | 成交存在但找不到订单 | P0 | 人工分配，保留成交 |
+| `AMBIGUOUS_MATCH` | 多个候选订单，无法唯一匹配 | P0/P1 | 人工指定，记录 match_method |
+| `ACCOUNT_SNAPSHOT_MISSING` | 无有效账户快照 | P0 | 当日 NO_TRADE |
+| `FORMAL_RECON_PENDING` | T+1 13:00 前未完成正式对账 | P0 | T+1 14:30 NO_TRADE |
 | `QTY_MISMATCH` | 持仓数量不一致 | P0 | 人工复核，禁止次日交易 |
 | `CASH_MISMATCH` | 现金不一致 | P0 | 核查费用/分红/出入金 |
 | `FEE_MISMATCH` | 费用差 | P1/P0 | 仅当差异 ≤ 0.01 元且为四舍五入导致时可自动调整；否则人工复核 |
@@ -2708,14 +3134,16 @@ class Notifier(Protocol):
 
 `recon_report.md`：
 
+- `recon_type`：PRELIM / FORMAL；
 - 日期、账户、期初/期末权益；
-- 订单数/成交数/成交率；
+- 数据来源：当日成交查询 / 正式对账单 `statement_id` / 账户快照 `snapshot_id`；
+- 订单数/成交数/成交率/匹配率（MATCHED/UNMATCHED/AMBIGUOUS）；
 - 持仓对比表；
 - 现金流水；
 - 差异列表、级别、状态；
 - 处理人/处理时间/备注；
 - 结论：PASS/WARN/FAIL；
-- 对次日交易的影响。
+- 对次日交易的影响：是否允许 14:30 信号。
 
 ### 9.7 归因
 
@@ -2785,29 +3213,34 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 
 ### 9.8 一致性报告
 
-每日 `consistency_report.md` 必须包含：
+每日 `consistency_report.md`（PRELIM）以及 T+1 的 FORMAL 版必须包含：
 
 1. **信号一致性**：目标组合 vs 订单 vs 实际成交；
-2. **持仓一致性**：内部台账 vs 券商；
-3. **现金一致性**：内部现金 vs 券商；
-4. **价格一致性**：市值价格 vs 行情源；
-5. **规则一致性**：T+1、整手、涨跌停、停牌、费用；
-6. **数据一致性**：多源冲突、缺失、延迟；
-7. **风险一致性**：目标暴露 vs 实际暴露、回撤等级；
-8. **结论**：PASS/WARN/FAIL + 次日是否允许交易。
+2. **账户快照一致性**：14:20 快照 vs 内部台账；缺失/过期直接 NO_TRADE；
+3. **持仓一致性**：内部台账 vs 当日成交查询/T+1 对账单；
+4. **现金一致性**：内部现金 vs 券商场内资金/对账单；
+5. **价格一致性**：市值价格 vs 行情源；
+6. **规则一致性**：T+1、整手、涨跌停、停牌、费用、ST 规则日期；
+7. **数据一致性**：关键字段冲突、缺失、延迟；
+8. **成交匹配**：MATCHED/UNMATCHED/AMBIGUOUS 数量与处理状态；
+9. **对账阶段**：PRELIM/FORMAL 状态、结论、是否允许次日 14:30 交易；
+10. **风险一致性**：目标暴露 vs 实际暴露、回撤等级。
 
 报告模板字段：
 
 ```text
 日期：
 信号版本：
+对账阶段：PRELIM / FORMAL
+账户快照：时间 / 状态 / 总资产 / 可用资金
 账户权益：期初 / 期末 / 收益
 目标仓位 / 实际仓位 / 现金
 订单数 / 成交数 / 未成交数 / 部分成交数
+成交匹配：MATCHED / UNMATCHED / AMBIGUOUS
 换手（目标/实际）
 费用（佣金/印花/过户/滑点）
 差异数量 / 级别 / 处理状态
-数据质量：覆盖率/冲突率/快照延迟
+数据质量：关键字段覆盖率/冲突率/快照延迟
 结论：PASS/WARN/FAIL
 阻断项：
 处理人/时间：
@@ -2888,7 +3321,7 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 ### 10.4 可观测性
 
 - 结构化日志（JSON）：`run_id`、`trade_date`、`module`、`event`、`duration_ms`、`status`、`error`；
-- 指标：任务耗时、成功率、数据延迟、冲突率、信号数量、订单数量、成交率、换手、回撤、对账差异；
+- 指标：任务耗时、成功率、数据延迟、关键对象冲突率、信号数量、订单数量、成交率、换手、回撤、PRELIM/FORMAL 对账差异、账户快照状态；
 - 追踪：一次信号 run 的完整链路（数据 -> 因子 -> 组合 -> 风控 -> 推送 -> 成交 -> 对账）；
 - 审计：谁在何时改了什么（配置、订单、成交、override）；
 - 报告：每日/每周/每月。
@@ -2927,6 +3360,7 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 2. 科创板买入 150 股拒绝；200 股允许；250 股允许；持仓 250 卖 100 拒绝；卖 200 允许；卖 250 允许；持仓 150 全部卖出允许；
 3. T 日买入，T 日卖出拒绝；T+1 卖出允许；
 4. 涨停买入不成交；跌停卖出不成交；一字板不成交；
+4.1 规则按日期切换：2026-07-03 主板 ST 涨停价按 5%，2026-07-06 起按 10%；创业板/科创板 ST 按 20%；退市整理首日无涨跌幅，次日起主板 10%、创业板/科创板 20%；
 5. 停牌日订单拒绝/过期；复牌日按规则成交；
 6. 除权日涨停价用 `prev_close_ref`；持仓数量/现金按分红送转调整；
 7. 佣金最低 5 元；印花税仅卖出；过户费双边；
@@ -2940,19 +3374,30 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 15. 重复运行幂等；重复成交导入去重；
 16. 飞书失败降级；告警级别正确；
 17. 回撤阈值触发降仓；滞回不抖动；
-18. 退市股回测不消失；退市损失计入。
+18. 退市股回测不消失；退市损失计入；
+19. 资金推导：15 万权益 -> N=10、单票约 1.47 万、上限 1.8 万；股价 150 元一手可买，股价 200 元一手剔除；低于 15 万 NO_TRADE；
+20. 参与率：订单≤0.1% ADV20 全额成交；>0.1% 按 10% bar 量部分成交；>1% ADV20 事前拒绝；
+21. 5 分钟缺失时 `intraday_enabled=false`，日频信号仍能生成，报告标注；
+22. 账户快照缺失/过期/数量不一致 -> NO_TRADE；
+23. 券商成交无 `client_order_id` -> 弱匹配/`UNMATCHED`/`AMBIGUOUS`，不拒收、不丢成交；
+24. 金额/价格以整数分记账，重复回放无浮点尾差；
+25. 2015+ `daily-research` 至少 5 折 walk-forward；近期 `production-replay` 单独报告。
 
 ### 11.3 上线验收
 
 必须全部满足：
 
-- [ ] 数据：连续 20 个交易日无 P0 数据故障；
+- [ ] 数据校准：完成至少 2–4 周真实数据校准，冻结 `data_gate_profile`；
+- [ ] 数据：连续 20 个交易日无 critical P0 数据故障；全市场 P1 有记录；
+- [ ] 账户快照：连续 20 个交易日 14:25 前有效；缺失演练返回 NO_TRADE；
 - [ ] 信号：每个交易日 14:35 前生成并推送；
 - [ ] 风控：所有订单通过事前检查；无静默跳过；
-- [ ] 对账：连续 20 个交易日 PASS 或 WARN 已闭环，无未解决 P0；
-- [ ] 回测：T+1/涨跌停/停牌/整手/费用测试全过；
-- [ ] 前视：future injection/shift test 全过；
-- [ ] 模拟盘：至少 20 个交易日人工执行 + 交割单录入 + 对账；
+- [ ] 对账：连续 20 个交易日 PRELIM PASS/WARN；FORMAL 在 T+1 13:00 前完成或闭环；
+- [ ] 回测：T+1/涨跌停/停牌/整手/费用/2026-07-06 ST 规则测试全过；
+- [ ] 回测：2015+ daily-research 多折 walk-forward；近期 production-replay 执行校准；
+- [ ] 前视：future injection/shift test 全过；`first_seen_at` 语义测试通过；
+- [ ] 资金：15 万账户可正常建 10 只、一手/佣金/单票上限可行；
+- [ ] 模拟盘：至少 20 个交易日人工执行 + 当日成交查询 + T+1 对账单 + 对账；
 - [ ] 回撤：演练触发/降仓/恢复；
 - [ ] 备份：恢复演练成功；
 - [ ] 文档：运行手册、故障手册、上线检查表完成；
@@ -2967,24 +3412,24 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 | 阶段 | 周期 | 交付 |
 |---|---|---|
 | P0 基础 | 1 周 | 仓库骨架、配置、日历、证券主数据、Parquet/DuckDB、SQLite、日志 |
-| P1 数据 | 2 周 | 日线/复权/财务/状态/行业/公司行为采集；多源校验；PIT；质量门禁 |
+| P1 数据 | 2–4 周 | 日线/复权/财务/状态/行业/公司行为采集；多源校验；PIT；**真实数据校准期**；质量门禁 |
 | P2 因子 | 2 周 | 因子注册表、增量缓存、预处理、价值/质量/动量/日内/WQ101、评测 |
-| P3 组合 | 1–2 周 | 打分、TopN、约束、换手、订单/调仓单、单测 |
-| P4 回测 | 2 周 | Backtrader、AShareBroker、T+1/涨跌停/停牌/整手/费用、报告 |
-| P5 实盘 | 2 周 | 14:30 信号、飞书、事前风控、回撤、交割单、对账、归因 |
-| P6 试运行 | 4 周 | 模拟盘/小资金实盘、调参、稳定性、上线验收 |
+| P3 组合 | 1–2 周 | 打分、资金推导 N、约束、10% 换手、订单/调仓单、单测 |
+| P4 回测 | 2–3 周 | `AShareReplayEngine`；2015+ daily-research；近期 production-replay；T+1/涨跌停/停牌/整手/费用 |
+| P5 实盘 | 2–3 周 | 14:20 账户快照、14:30 信号、飞书、事前风控、回撤、成交录入、T+1 正式对账、归因 |
+| P6 试运行 | 6–8 周 | 2–4 周数据校准 + 20 个交易日模拟盘/小资金实盘、调参、稳定性、上线验收 |
 
 ### 12.2 MVP 范围
 
 必须：
 
-- 日线/复权/财务/状态/快照；
-- 股票池排除 ST/新股/退市/停牌；
-- 价值/质量/动量/日内/WQ101 精选；
-- 等权合成、TopN、换手/单票/行业约束；
-- Backtrader 回测含 T+1/涨跌停/停牌/整手/费用；
-- 14:30 信号 + 飞书 + 调仓单；
-- 交割单录入 + 对账 + 持仓更新；
+- 日线/复权/财务/状态/14:30 快照；5 分钟可选；
+- 股票池拆分 buy/hold/exit，排除 ST/新股/退市/停牌买入；
+- 价值/质量/动量/WQ101 精选；日内因子可选；
+- 资金推导 N、等权合成、10% 换手/动态单票/行业约束；
+- 自研回放引擎含 T+1/涨跌停/停牌/整手/费用；
+- 14:20 账户快照 + 14:30 信号 + 飞书 + 调仓单；
+- 当日成交查询 + T+1 正式对账单 + PRELIM/FORMAL 对账 + 持仓更新；
 - 回撤分级；
 - 日报/归因。
 
@@ -3002,13 +3447,15 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 免费源不稳定/接口变更 | 信号缺失/错误 | 多源、缓存、告警、适配器隔离、付费备源 |
-| 5 分钟历史不足 | 无法做长周期官方回测 | 明确样本起点；不用日线冒充；逐步积累 |
+| 免费源不稳定/阈值过严 | 频繁 NO_TRADE | 2–4 周校准；P0 只覆盖 critical；全市场 P1；多源/缓存/隔离 |
+| 5 分钟历史不足 | 无法做长周期 14:35 回放 | 长历史用 2015+ daily-research；production-replay 只做近期校准；不伪造 14:35 成交 |
 | 财务 PIT 不完整 | 前视/错误因子 | 公告日、版本、缺失处理、回测声明 |
 | ST/退市历史重建误差 | 股票池偏差 | 公告/状态源优先；名称辅助；保守排除 |
 | 生存者偏差 | 回测高估 | 包含退市股；历史池；对比测试 |
 | A 股规则变化 | 回测/实盘错 | 规则表按日期；交易所公告；回归测试 |
-| Backtrader 维护慢 | 长期风险 | 锁版本、适配层、关键规则自测 |
+| 自研引擎撮合/记账出错 | 回测失真 | 规则表驱动、黄金用例、属性测试、双实现对账 |
+| 券商正式对账单延迟/无订单号 | 对账无法完成 | 默认 T+1 正式对账；当日成交查询做 PRELIM；弱匹配/人工分配 |
+| 账户快照缺失/错误 | 无法确认资金/持仓基线 | 14:20 强制抓取；缺失/不一致 NO_TRADE；收盘再抓一份 |
 | 人工执行延迟/遗漏 | 滑点/未成交 | SLA、告警、调仓单、截止时间、不追单 |
 | 对账差异未闭环 | 持仓/现金错误 | 硬阻断、人工复核、审计 |
 | 过拟合/因子衰减 | 实盘不达预期 | 样本外、Walk-forward、多重检验、因子准入 |
@@ -3020,18 +3467,20 @@ opportunity_cost = Σ_i max(0, signed_unfilled_i * (p_close_i - p_decision_i)) /
 
 以下为设计默认值，落地前需要确认：
 
-1. 初始资金规模、券商佣金/最低佣金、是否有券商 CSV 交割单；
-2. 目标持仓数 N（默认 30）、单票上限（5%）、行业上限（20%）；
-3. 换手上限（默认单日单边 20%）与再平衡频率；
+1. 初始资金规模、券商佣金/最低佣金、券商对账单/成交查询格式；
+2. `min_equity`、`min_position_value`、`min_n`、`max_n`、单票上限公式参数（默认 15 万/15k/10/30、1.2/N，clamp 5–15%）；
+3. 换手上限（默认单日 10%、5 日 30%）与再平衡频率；
 4. 新股上市天数阈值（默认 120 个交易日）；
 5. 是否纳入金融股；金融股的杠杆/应计因子如何处理；
 6. 行业分类源（申万 2021）与历史成分是否可得；
-7. 5 分钟数据的历史深度与是否接受付费备源；
+7. 5 分钟数据历史深度；是否接受 `intraday_enabled=false`（仅日频因子）；
 8. 飞书群/机器人/应用权限，是否需要文件上传；
 9. 基准选择（默认中证全指）；
 10. 回撤阈值（5/8/12/15%）与恢复规则；
 11. 是否允许人工 override 风控，以及审批人；
-12. 部署位置（本机/境内云主机）与备份方案。
+12. 部署位置（本机/境内云主机）与备份方案；
+13. Tushare token/积分是否可用（默认关闭，不作为主源）；
+14. 账户快照的获取方式（App/CSV/截图）与操作人。
 
 ---
 
@@ -3060,6 +3509,8 @@ CREATE TABLE signal_run (
     trade_date        TEXT NOT NULL,
     data_as_of        TEXT NOT NULL,
     decided_at        TEXT,
+    account_snapshot_id TEXT,
+    fill_policy       TEXT, -- live_actual/production_14_35/daily_next_open
     mode              TEXT NOT NULL, -- LIVE/BACKTEST/PAPER
     signal_version    INTEGER NOT NULL DEFAULT 1,
     universe_version  TEXT NOT NULL,
@@ -3076,6 +3527,8 @@ CREATE TABLE signal_run (
 
 ### A.2 订单与成交
 
+> 金额/价格一律用**整数最小单位**，数量用整数股；禁止用 `REAL` 存金额/价格。订单限价/参考价用整数分（A 股 tick 0.01）；券商成交均价若需要 3–4 位小数，用 `price_micros`/`avg_cost_micros`（整数 1e-6 元）另存，不用浮点。因子值、收益率可以用 `REAL/DOUBLE`。
+
 ```sql
 CREATE TABLE orders (
     client_order_id  TEXT PRIMARY KEY,
@@ -3085,40 +3538,89 @@ CREATE TABLE orders (
     side             TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
     qty              INTEGER NOT NULL CHECK (qty > 0),
     order_type       TEXT NOT NULL DEFAULT 'LIMIT',
-    limit_price      REAL NOT NULL CHECK (limit_price > 0),
-    ref_price        REAL NOT NULL,
-    target_weight    REAL,
-    current_qty      INTEGER,
-    amount_est       REAL,
-    reason           TEXT,
-    priority         INTEGER NOT NULL,
-    status           TEXT NOT NULL, -- NEW/RISK_APPROVED/PUSHED/SENT_TO_MANUAL/PARTIAL/FILLED/EXPIRED/CANCELLED/REJECTED
-    valid_until      TEXT,
-    risk_flags       TEXT,
-    created_at       TEXT NOT NULL,
-    updated_at       TEXT NOT NULL
+    limit_price_cents INTEGER NOT NULL CHECK (limit_price_cents > 0),
+    ref_price_cents   INTEGER NOT NULL,
+    target_weight     REAL,
+    current_qty       INTEGER,
+    amount_est_cents  INTEGER,
+    reason            TEXT,
+    priority          INTEGER NOT NULL,
+    status            TEXT NOT NULL, -- NEW/RISK_APPROVED/PUSHED/SENT_TO_MANUAL/PARTIAL/FILLED/EXPIRED/CANCELLED/REJECTED
+    valid_until       TEXT,
+    risk_flags        TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
 );
 
 CREATE TABLE fills (
     fill_id          TEXT PRIMARY KEY,
-    client_order_id  TEXT NOT NULL REFERENCES orders(client_order_id),
+    client_order_id  TEXT REFERENCES orders(client_order_id), -- 券商成交可能没有订单号，允许空
+    broker_order_id  TEXT,
     broker_trade_id  TEXT,
+    statement_id     TEXT,
     trade_date       TEXT NOT NULL,
     code             TEXT NOT NULL,
-    side             TEXT NOT NULL,
+    side             TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
     qty              INTEGER NOT NULL CHECK (qty > 0),
-    price            REAL NOT NULL CHECK (price > 0),
-    commission       REAL NOT NULL DEFAULT 0,
-    stamp_duty       REAL NOT NULL DEFAULT 0,
-    transfer_fee     REAL NOT NULL DEFAULT 0,
+    price_cents      INTEGER NOT NULL CHECK (price_cents > 0),
+    commission_cents INTEGER NOT NULL DEFAULT 0,
+    stamp_duty_cents INTEGER NOT NULL DEFAULT 0,
+    transfer_fee_cents INTEGER NOT NULL DEFAULT 0,
     executed_at      TEXT NOT NULL,
-    source           TEXT NOT NULL, -- MANUAL/CSV/BACKTEST
+    source           TEXT NOT NULL, -- MANUAL/CSV/BROKER_STATEMENT/BACKTEST
+    match_status     TEXT NOT NULL, -- MATCHED/UNMATCHED/AMBIGUOUS
+    match_method     TEXT,          -- BROKER_TRADE_ID/ORDER_ID/COMPOSITE/FIFO/MANUAL
+    match_confidence REAL,
+    raw_hash         TEXT,
     created_at       TEXT NOT NULL,
-    UNIQUE(broker_trade_id)
+    UNIQUE(broker_trade_id),
+    UNIQUE(raw_hash)
 );
 
 CREATE INDEX idx_fills_order ON fills(client_order_id);
+CREATE INDEX idx_fills_match ON fills(match_status);
 CREATE INDEX idx_orders_date ON orders(trade_date);
+
+CREATE TABLE broker_statement (
+    statement_id     TEXT PRIMARY KEY,
+    trade_date       TEXT NOT NULL,
+    imported_at      TEXT NOT NULL,
+    source_file      TEXT,
+    content_hash     TEXT NOT NULL,
+    status           TEXT NOT NULL, -- IMPORTED/RECONCILED/FAIL
+    UNIQUE(content_hash)
+);
+
+CREATE TABLE account_snapshot (
+    snapshot_id      TEXT PRIMARY KEY,
+    trade_date       TEXT NOT NULL,
+    captured_at      TEXT NOT NULL,
+    captured_by      TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    total_assets_cents INTEGER NOT NULL,
+    cash_cents       INTEGER NOT NULL,
+    available_cash_cents INTEGER NOT NULL,
+    market_value_cents INTEGER NOT NULL,
+    frozen_cents     INTEGER NOT NULL DEFAULT 0,
+    position_count   INTEGER NOT NULL,
+    content_hash     TEXT,
+    file_path        TEXT,
+    status           TEXT NOT NULL, -- VALID/STALE/MISMATCH
+    first_seen_at    TEXT,
+    available_at     TEXT,
+    available_at_quality TEXT,
+    created_at       TEXT NOT NULL
+);
+
+CREATE TABLE account_snapshot_position (
+    snapshot_id      TEXT NOT NULL REFERENCES account_snapshot(snapshot_id),
+    code             TEXT NOT NULL,
+    total_qty        INTEGER NOT NULL,
+    available_qty    INTEGER NOT NULL,
+    avg_cost_cents   INTEGER NOT NULL,
+    market_value_cents INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, code)
+);
 ```
 
 ### A.3 持仓与现金
@@ -3129,10 +3631,10 @@ CREATE TABLE positions (
     code            TEXT NOT NULL,
     total_qty       INTEGER NOT NULL,
     available_qty   INTEGER NOT NULL,
-    avg_cost        REAL NOT NULL,
-    last_price      REAL,
-    market_value    REAL,
-    unrealized_pnl  REAL,
+    avg_cost_cents  INTEGER NOT NULL,
+    last_price_cents INTEGER,
+    market_value_cents INTEGER,
+    unrealized_pnl_cents INTEGER,
     updated_at      TEXT NOT NULL,
     PRIMARY KEY (trade_date, code)
 );
@@ -3141,8 +3643,8 @@ CREATE TABLE cash_ledger (
     entry_id        TEXT PRIMARY KEY,
     trade_date      TEXT NOT NULL,
     entry_type      TEXT NOT NULL, -- BUY/SELL/FEE/DIVIDEND/TRANSFER/ADJUST
-    amount          REAL NOT NULL,
-    balance         REAL NOT NULL,
+    amount_cents    INTEGER NOT NULL,
+    balance_cents   INTEGER NOT NULL,
     ref_id          TEXT,
     note            TEXT,
     created_at      TEXT NOT NULL
@@ -3150,10 +3652,10 @@ CREATE TABLE cash_ledger (
 
 CREATE TABLE equity_curve (
     trade_date      TEXT PRIMARY KEY,
-    equity          REAL NOT NULL,
-    cash            REAL NOT NULL,
-    market_value    REAL NOT NULL,
-    hwm             REAL NOT NULL,
+    equity_cents    INTEGER NOT NULL,
+    cash_cents      INTEGER NOT NULL,
+    market_value_cents INTEGER NOT NULL,
+    hwm_cents       INTEGER NOT NULL,
     drawdown        REAL NOT NULL,
     exposure        REAL NOT NULL
 );
@@ -3165,6 +3667,9 @@ CREATE TABLE equity_curve (
 CREATE TABLE recon_run (
     run_id          TEXT PRIMARY KEY,
     trade_date      TEXT NOT NULL,
+    recon_type      TEXT NOT NULL, -- PRELIM/FORMAL
+    statement_id    TEXT REFERENCES broker_statement(statement_id),
+    account_snapshot_id TEXT REFERENCES account_snapshot(snapshot_id),
     status          TEXT NOT NULL, -- PASS/WARN/FAIL
     hard_breaks     INTEGER NOT NULL DEFAULT 0,
     soft_breaks     INTEGER NOT NULL DEFAULT 0,
@@ -3181,6 +3686,7 @@ CREATE TABLE recon_breaks (
     expected        TEXT,
     actual          TEXT,
     diff            TEXT,
+    diff_cents      INTEGER,
     severity        TEXT NOT NULL, -- P0/P1/P2
     status          TEXT NOT NULL, -- OPEN/RESOLVED/IGNORED
     resolution      TEXT,
@@ -3233,14 +3739,27 @@ system:
   timezone: Asia/Shanghai
   mode: live
   signal_time: "14:30:00"
+  account_snapshot_time: "14:20:00"
+  account_snapshot_max_age_minutes: 15
   execution_deadline: "14:55:00"
-  fill_entry_deadline: "15:05:00"
-  recon_deadline: "16:30:00"
+  same_day_fill_deadline: "15:05:00"
+  prelim_recon_deadline: "15:30:00"
+  formal_statement: {day_offset: 1, time: "09:30"}
+  formal_recon: {day_offset: 1, time: "10:00", cutoff: "13:00"}
 
 data:
   root: "./data"
   raw_retention_days: 730
   snapshot_retention_days: 1095
+  calibration_mode: true
+  gate_profile: "calibrated_2026Q4"
+  source_enabled:
+    baostock: true
+    eastmoney: true
+    sina: true
+    tencent: true
+    cninfo: true
+    tushare: false          # 有 token/积分再启用，不假设免费
   crosscheck:
     price_abs_tol: 0.01
     price_rel_tol: 0.001
@@ -3248,8 +3767,9 @@ data:
     amount_rel_tol: 0.01
     adj_factor_rel_tol: 1.0e-6
   gates:
-    max_conflict_rate: 0.005
-    min_daily_coverage: 0.995
+    critical_fields: [close, preclose, prev_close_ref, limit_up, limit_down, is_suspended, is_st, is_delisting, volume, amount]
+    market_min_coverage: 0.95
+    market_conflict_p1: 0.02
     max_snapshot_lag_seconds: 30
 
 universe:
@@ -3257,10 +3777,13 @@ universe:
   min_listed_trading_days: 120
   min_price: 2.0
   min_adv20_amount: 20000000
-  exclude_st: true
-  exclude_delisting: true
-  exclude_suspended: true
-  exclude_new: true
+  buy_exclude_st: true
+  buy_exclude_delisting: true
+  buy_exclude_suspended: true
+  buy_exclude_new: true
+  force_exit_on_st: true
+  force_exit_on_delisting: true
+  force_exit_on_blocklist: true
 
 factors:
   min_coverage: 0.6
@@ -3269,14 +3792,20 @@ factors:
   clip_z: 5.0
   neutralize_industry: true
   neutralize_size: false
+  intraday_enabled: auto   # auto/true/false；5 分钟不足时自动关闭
 
 portfolio:
-  top_n: 30
-  min_positions: 20
-  max_weight: 0.05
+  min_equity: 150000
+  min_position_value: 15000
+  min_n: 10
+  max_n: 30
+  min_positions_ratio: 0.8
+  max_weight_abs: 0.15
+  max_weight_formula: "min(max_weight_abs, max(0.05, 1.2 / N))"
   industry_max: 0.20
   cash_buffer: 0.02
-  max_daily_turnover: 0.20
+  max_daily_turnover: 0.10
+  max_5d_turnover: 0.30
   buffer_ratio: 0.20
   max_new_names_per_day: 5
   min_hold_days: 1
@@ -3297,14 +3826,21 @@ risk:
     hysteresis: 0.02
   pretrade:
     max_price_deviation: 0.03
-    max_participation: 0.01
-    max_single_weight: 0.05
+    max_order_to_adv20: 0.01
+    max_single_weight_abs: 0.15
     max_industry_weight: 0.20
-    max_turnover: 0.20
+    max_daily_turnover: 0.10
+    max_5d_turnover: 0.30
+    require_account_snapshot: true
 
 trading:
+  price_policy:
+    production_fill: "14:35_bar_open"
+    daily_research_fill: "T+1_open"
+    live_fill: "broker_actual"
   slippage_bps: 5
-  participation_rate: 0.01
+  participation_rate: 0.10
+  small_order_adv_threshold: 0.001
   lot_rules:
     SH_MAIN: {min_qty: 100, step: 100}
     SZ_MAIN: {min_qty: 100, step: 100}
@@ -3326,11 +3862,11 @@ notify:
     - email
 
 backtest:
-  engine: backtrader
-  mode: production-replay
-  benchmark: "000985.CSI"  # 中证全指示例
-  start: "2021-01-01"
-  end: "2025-12-31"
+  engine: custom
+  mode: daily-research
+  daily_start: "2015-01-01"
+  production_start: "2021-01-01"
+  benchmark: "000985.CSI"
   slippage_bps: 5
   commission_rate: 0.00025
   min_commission: 5.0
@@ -3351,15 +3887,16 @@ trade_date,signal_version,code,name,side,current_qty,target_qty,delta_qty,ref_pr
 ### C.2 交割单 CSV
 
 ```csv
-broker_trade_id,client_order_id,trade_date,code,side,qty,price,commission,stamp_duty,transfer_fee,executed_at,note
-T202611130001,<order_id>,2026-11-13,600000,SELL,1000,10.48,5.00,5.24,0.10,2026-11-13T14:40:12,部分成交
-T202611130002,<order_id>,2026-11-13,000001,BUY,300,11.24,5.00,0.00,0.03,2026-11-13T14:42:05,
+broker_trade_id,broker_order_id,client_order_id,statement_id,trade_date,code,side,qty,price,commission,stamp_duty,transfer_fee,executed_at,note
+T202611130001,<broker_order_id>,,,2026-11-13,600000,SELL,1000,10.48,5.00,5.24,0.10,2026-11-13T14:40:12,部分成交
+T202611130002,<broker_order_id>,,STMT20261114,2026-11-13,000001,BUY,300,11.24,5.00,0.00,0.03,2026-11-13T14:42:05,
 ```
 
 字段要求：
 
-- `broker_trade_id` 必填且唯一；无则用系统生成的 `manual-{uuid}`，并备注；
-- `client_order_id` 必须匹配系统订单；
+- `broker_trade_id` 优先；无则用系统生成的 `manual-{uuid}`，并备注；
+- `broker_order_id` 优先用于匹配；`client_order_id` **可空**，不要求券商提供；
+- `statement_id` 在 T+1 正式对账单导入时填写；当日查询可空；
 - 数量为正整数；
 - 价格保留 2–3 位小数；
 - 费用非负；
@@ -3377,10 +3914,10 @@ T202611130002,<order_id>,2026-11-13,000001,BUY,300,11.24,5.00,0.00,0.03,2026-11-
       "template": "blue"
     },
     "elements": [
-      {"tag": "div", "text": {"tag": "lark_md", "content": "**账户**：总资产 ¥1,000,000｜可用 ¥120,000｜目标仓位 98%"}},
-      {"tag": "div", "text": {"tag": "lark_md", "content": "**风险**：NORMAL｜回撤 -2.1%｜数据 PASS｜对账 PASS"}},
+      {"tag": "div", "text": {"tag": "lark_md", "content": "**账户**：总资产 ¥1,000,000｜可用 ¥120,000｜目标仓位 98%｜快照 14:20 VALID"}},
+      {"tag": "div", "text": {"tag": "lark_md", "content": "**风险**：NORMAL｜回撤 -2.1%｜数据 PASS｜PRELIM PENDING / FORMAL PASS"}},
       {"tag": "div", "text": {"tag": "lark_md", "content": "**交易**：买入 5｜卖出 4｜预计换手 8.2%｜费用 ¥320"}},
-      {"tag": "div", "text": {"tag": "lark_md", "content": "**执行窗口**：14:35–14:55｜**交割单截止**：15:05"}},
+      {"tag": "div", "text": {"tag": "lark_md", "content": "**执行窗口**：14:35–14:55｜**当日成交查询**：15:05｜**T+1 对账单**：09:30"}},
       {"tag": "action", "actions": [
         {"tag": "button", "text": {"tag": "plain_text", "content": "查看调仓单"}, "url": "http://127.0.0.1:8080/reports/..."}
       ]}
@@ -3522,7 +4059,9 @@ ts_rank((volume / adv20), 20) * ts_rank((-1 * delta(close, 7)), 8)
 实现备注：
 
 - `Alpha#049` 与 `Alpha#051` 公式相近/重复，第一版只保留一个，避免重复暴露；
-- 公式中的 `close/open/high/low/vwap` 使用复权价，`volume/adv20` 使用股数；
+- **公式中的 `close/open/high/low/vwap` 一律指 T-1 完整日线，不是 T 日 14:30 的 `last_1430`**；`volume/adv20` 也用 T-1 完整日成交量；
+- T-1 价格使用复权价，`vwap_d = amount_d / volume_d` 同比例复权；`volume/adv20` 使用股数；
+- 只有命名为 `intraday_*` 的因子才允许使用 `last_1430`/5 分钟线；不要改写 WQ101 公式去混用 14:30 价格；
 - `Alpha#024` 的条件分支必须用向量化 `when/then`，并处理 `delay(close,100)=0`；
 - 所有 alpha 输出先做 MAD/zscore，再进入合成；
 - 若某 alpha 与现有因子相关性 > 0.8，进入聚类去重；
