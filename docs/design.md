@@ -1,6 +1,6 @@
 # QuantX：A 股日频量化回测与人工实盘系统详细设计
 
-> 文档版本：v1.6<br>
+> 文档版本：v1.7<br>
 > 状态：设计稿（已按 review 意见修订）<br>
 > 适用市场：上海证券交易所主板、深圳证券交易所主板、创业板、科创板<br>
 > 交易方式：系统生成信号与调仓单，人工在券商客户端执行<br>
@@ -193,6 +193,21 @@
 | 影子存储 | `shadow_positions`/`shadow_equity_curve` 以 `release_id` 为分区键 |
 | 风险减持命名 | 统一 `min_risk_reduction_value=max(100 元,1%×权益)` 与 `RISK_REDUCTION_NO_EFFECT` |
 | 回撤滞回 | 明确 state hysteresis 与 recovery `worsen_tolerance` 是两个参数，执行文案引用变量 |
+
+### 0.11 v1.7 review 修订摘要
+
+| 主题 | 处理 |
+|---|---|
+| 送转股税持有期 | 增加 `tax_holding_start`；`acquired_date` 只表示入账日；送转 lot 继承原 lot 的税持有期；删除重复 `sellable_same_day` |
+| 风险减持最小金额 | 改为 `min(max(100 元,1%×权益),min_trade_value)`，不会在大账户高于 `min_trade_value` |
+| 回撤滞回 | 9.4.2 改为 `entry_threshold - hysteresis`；恢复不跳级：DE_RISK -> WATCH -> NORMAL |
+| PRELIM 生命周期 | FORMAL/ provisional 分成两个独立集合；formal 无匹配新建 CONFIRMED 并告警，provisional 未确认转 ORPHAN，人工确认后才 REVERSAL |
+| FORMAL 关账 | FORMAL PASS 前所有 provisional 必须为 CONFIRMED、SUPERSEDED+REVERSAL、或 ORPHAN 已处理 |
+| 现金预期 | `cash_timing_item` 是现金到账匹配唯一来源；`accrual_ledger` 只保留 NAV 应计，删除 status/matched_cash_entry_id |
+| 影子列 | `equity_curve` 删除 shadow* 列，从 `shadow_equity_curve` join |
+| raw 约束 | 删除 `fills.raw_hash/UNIQUE(raw_hash)`，raw 只按 `(source,raw_hash)` 幂等 |
+| 订单字段 | `orders` 增加 `locked_qty/sellable_qty` |
+| 风险终态 | `risk_reduction_run` 增加 `NO_EFFECT`、`no_effect_reason`、`no_effect_value_cents` |
 
 ---
 
@@ -617,7 +632,7 @@ sequenceDiagram
   -> 16:30 初步 PnL、行业/因子/执行归因、日报（标注 preliminary）
   -> 18:00 备份、归档、告警汇总
   -> T+1 09:30 券商正式对账单/交割单导入
-  -> T+1 10:00 正式对账 FORMAL（先入账 T 日成交，再对内部台账 vs 券商对账单 vs 行情）
+  -> T+1 10:00 正式对账 FORMAL（确认/调整/冲销 T 日 provisional fill，再对内部台账 vs 券商对账单 vs 行情）
   -> T+1 13:00 正式对账截止；未完成 -> FORMAL_PENDING，最多 2 日；超时 -> BLOCK_NORMAL
 ```
 
@@ -1859,6 +1874,8 @@ interest_accrued_t = cash_total * annual_rate / 365
 | 红利税应扣 | `code + sell_date + lot_id + TAX_FINAL` | 卖出后 T+1 至 T+3 | 超时 -> `CASH_TIMING_EXPIRED` P0，转 `CASH_MISMATCH` 审查 |
 | 应计利息 | `cash_account + interest_period + INTEREST_ACCRUED` | 券商结息日 ±5 个交易日 | 超时 -> `CASH_TIMING_EXPIRED` P1 |
 
+`cash_timing_item` 是**现金到账匹配的唯一来源**；`accrual_ledger` 只保存 NAV 应计，不参与现金匹配，也不保存 `status/matched_cash_entry_id`。
+
 `cash_timing_item` 状态：`OPEN/PARTIAL/MATCHED/EXPIRED`；匹配金额容差：
 
 ```text
@@ -2676,7 +2693,7 @@ build_target(score, prev, universe, tradability, constraints, risk, account):
      if multiplier < 1 且 actual_exposure > target_exposure + 1%:
         按“低分 -> 高波动 -> 可卖”生成风险减持单，直到实际暴露 <= 目标
         exit_required：完全豁免 min_trade_value/换手预算
-        risk_reduction：可低于 min_trade_value，但必须 >= min_risk_reduction_value（=max(100 元, 1%×权益)）或合并到后续卖单
+        risk_reduction：可低于 min_trade_value，但必须 >= min_risk_reduction_value（=min(max(100 元, 1%×权益), min_trade_value)）或合并到后续卖单
         低于阈值且无合并价值 -> RISK_REDUCTION_NO_EFFECT，不生成无意义订单
         locked 跳过并告警
  10. 取整/现金校验；locked 持仓市值不计入可用现金
@@ -3033,9 +3050,9 @@ PIT 数据
 class Lot:
     qty: int
     remaining_qty: int
-    acquired_date: date
+    acquired_date: date           # 入账日，不用于税持有期
     available_date: date          # 买入=T+1；送转股=new_shares_listing_date
-    sellable_same_day: bool = False
+    tax_holding_start: date       # 税持有期起点；送转股继承原 lot
 
 class T1Ledger:
     lots: dict[str, list[Lot]]
@@ -3051,15 +3068,18 @@ class T1Ledger:
             qty=qty, remaining_qty=qty,
             acquired_date=trade_date,
             available_date=next_trading_day(trade_date),
+            tax_holding_start=trade_date,
         ))
 
-    def apply_corp_action(self, code, qty_delta, available_date):
-        # 送转股：不套买入 T+1；available_date 来自公告，缺失才用保守日期
+    def apply_corp_action(self, code, qty_delta, available_date,
+                          source_lot: Lot):
+        # 送转股：不套买入 T+1；acquired_date 只记入账日
+        # tax_holding_start 继承原 lot，红利税持有期不能重置
         self.lots[code].append(Lot(
             qty=qty_delta, remaining_qty=qty_delta,
             acquired_date=available_date,
             available_date=available_date,
-            sellable_same_day=True,
+            tax_holding_start=source_lot.tax_holding_start,
         ))
 
     def sell(self, code, qty, trade_date):
@@ -3520,7 +3540,7 @@ AND critical_data_conflict == False
 - 账户快照缺失/数量不一致 -> `BLOCK_ALL`，因为无法确认可卖数量；
 - `EXPECTED_CORP_ACTION` 差异 -> 放行；其他 qty/cash mismatch -> `BLOCK_ALL`；
 - 风险减持单在 `BLOCK_NORMAL` 下也属于强制退出/降风险，可按上述条件放行；
-- `exit_required` 完全豁免 `min_trade_value`；`risk_reduction` 可低于 `min_trade_value`，但不得低于 `min_risk_reduction_value = max(min_risk_reduction_abs_cents, min_risk_reduction_pct × equity)`，否则合并/放弃并记 `RISK_REDUCTION_NO_EFFECT`；
+- `exit_required` 完全豁免 `min_trade_value`；`risk_reduction` 可低于 `min_trade_value`，但不得低于 `min_risk_reduction_value = min(max(min_risk_reduction_abs_cents, min_risk_reduction_pct × equity), min_trade_value)`，否则合并/放弃并记 `RISK_REDUCTION_NO_EFFECT`；
 - 所有 BLOCK 级别写入 `risk_decision`/`signal_run`，飞书必须显示级别和放行/禁止的订单。
 
 风控结果：
@@ -3574,20 +3594,29 @@ hysteresis = max(0.02, 0.25 * de_risk)     # 状态升降级用；恢复阶梯�
 
 > 阈值是风险预算，不是收益优化参数；应在回测/模拟盘中验证，不能按历史最大回撤反向拟合。波动缩放不是择时，只让风险阈值适配持仓板块的波动。
 
-滞回：
+滞回（全部使用上面的 `hysteresis`，不再写死 2 个百分点）：
 
-- DE_RISK 进入 `de_risk`，恢复到 `de_risk - 2%` 以下才回 NORMAL；
-- DEFENSIVE 进入 `defensive`，恢复到 `defensive - 2%` 以下才回 DE_RISK；
-- 避免阈值附近反复切换；
-- 快速下跌定义为单日跌幅 > `max(5%, 2 × sigma_daily)`，可直接跳级，但需记录原因。
+```text
+watch_recover     = watch     - hysteresis
+de_risk_recover   = de_risk   - hysteresis
+defensive_recover = defensive - hysteresis
+halt_recover      = halt      - hysteresis
+```
+
+- HALT -> DEFENSIVE：DD <= `halt_recover`；
+- DEFENSIVE -> DE_RISK：DD <= `defensive_recover`；
+- DE_RISK -> WATCH：DD <= `de_risk_recover`；
+- WATCH -> NORMAL：DD <= `watch_recover`；
+- **不允许 DE_RISK 直接跳回 NORMAL**：必须先经过 WATCH，WATCH 再按 `watch_recover` 回 NORMAL；这是有意的，避免刚降风险就立刻满仓；
+- 快速下跌定义为单日跌幅 > `max(5%, 2 × sigma_daily)`，可直接跳级降风险，但恢复仍逐级上升，不能跳级恢复。
 
 #### 9.4.3 执行
 
 - 14:30 读取上一交易日收盘回撤等级；
-- 若 14:30 快照显示回撤进一步扩大 ≥ 2 个百分点，升级；
+- 若 14:30 快照显示回撤进一步扩大 ≥ `intraday_worsen_threshold`（默认 2 个百分点），升级；
 - 降暴露通过目标权重乘数实现，不直接市价砸盘；
 - **不交易带不得阻止降暴露**：`multiplier<1` 时按“低分 -> 高波动 -> 可卖”生成减持单，直到实际暴露 ≤ 目标；
-- 风险减持不受换手预算/`min_trade_value` 限制；locked 持仓跳过并告警；
+- `exit_required` 完全不受换手预算/`min_trade_value` 限制；`risk_reduction` 不受换手预算，但受 `min_risk_reduction_value` 约束（可低于 `min_trade_value`）；locked 持仓跳过并告警；
 - 先卖低分、流动性好、非跌停/停牌的股票；
 - 跌停/停牌无法卖 -> `PENDING_EXIT`，次日继续；
 - 不加杠杆、不逆势加仓；
@@ -3693,7 +3722,7 @@ next_action, created_at
   - 价格在涨跌停内、在合理偏离内；
   - 费用非负；
   - 成交时间在交易时段；
-  - `broker_trade_id` 或 `raw_hash` 唯一，幂等；
+  - `broker_trade_id` 精确，或按 9.5.3.1 的容差匹配；`raw_hash` 只用于 raw 层幂等，不作为 Fill 唯一键；
 - 匹配结果：
   - `MATCHED`：找到唯一订单；
   - `UNMATCHED`：暂未找到订单，保留成交，进入人工分配；
@@ -3732,23 +3761,27 @@ next_action, created_at
 
 1. 两条 raw 都写入 `broker_trade_raw`，各自 `raw_hash`，记录 `source=PRELIM/FORMAL`；
 2. PRELIM 先建 `fills`，`identity_status=PROVISIONAL`，并应用台账；
-3. FORMAL 导入时：
-   - 按 `broker_trade_id` 或容差找到 provisional fill：
-     - 唯一匹配 -> 更新同一 `fill` 的费用/价格，`identity_status=CONFIRMED`，不新增成交；
-     - 无匹配 -> 新建 `CONFIRMED` fill，同时把原 provisional 标 `SUPERSEDED`，生成 `fill_adjustment(type=REVERSAL)` 冲销 provisional 台账，再应用 formal；
-     - 多个匹配 -> `AMBIGUOUS_IDENTITY`，人工处理，不自动双记；
-   - 数量/方向不一致 -> `FILL_CONFLICT`，不自动改；
-4. 数量冲突：
-   - 同一 `broker_trade_id` 但 qty 不同 -> `QTY_CONFLICT`，保留 provisional，不自动确认/冲销；
+3. **FORMAL 成交集合**独立处理：
+   - 每条 formal 按 `broker_trade_id` 或容差匹配 provisional：
+     - 唯一匹配 -> 更新同一 `fill` 的费用/价格，`identity_status=CONFIRMED`；
+     - 无匹配 -> 新建 `CONFIRMED`，记 `MISSING_PRELIM_FILL`（P1），**不自动冲销任何 provisional**；
+     - 多个匹配 -> `AMBIGUOUS_IDENTITY`，人工处理；
+   - 同一 `broker_trade_id` 但 qty 不同 -> `QTY_CONFLICT`，不自动确认。
+4. **PROVISIONAL 成交集合**在全部 formal 导入后独立关账：
+   - 已被某个 formal 确认 -> 关闭；
+   - 未被任何 formal 确认 -> `ORPHAN_FILL`（P0），**不自动冲销**；
+   - 人工确认确实是多余 provisional -> 生成 `fill_adjustment(type=REVERSAL, qty_delta=-qty)` 冲销；
+   - 人工确认是 formal 漏单 -> 补录 formal；若 provisional 数量/价格有误，再冲销重记；
+5. 数量冲突：
    - 无 ID 时先忽略 qty 找候选（date/code/side/broker_order/price/time），唯一候选但 qty 不同 -> `QTY_CONFLICT`；
-   - 只有完全找不到候选，才允许新建 formal + 冲销 provisional，并 P0 告警；
-5. 费用差额（正式单佣金/过户费/印花税与当日查询不同）不生成第二笔成交，生成 `fill_adjustment(type=FEE_DIFF)`，只应用一次；
-6. 两条 raw 通过 `economic_fill_id` 链接同一 `fill`；`raw_count`、`prelim_raw_id`、`formal_raw_id` 保留；
-7. `account_applied` 只在 fill 首次应用时置 1；`REVERSAL` 也必须有幂等键，且 `qty_delta` 必须能表达冲销数量。
+   - `QTY_CONFLICT` 保留 provisional，不自动确认/冲销。
+6. 费用差额（正式单佣金/过户费/印花税与当日查询不同）不生成第二笔成交，生成 `fill_adjustment(type=FEE_DIFF)`，只应用一次；
+7. 两条 raw 通过 `economic_fill_id` 链接同一 `fill`；`raw_count`、`prelim_raw_id`、`formal_raw_id` 保留；
+8. `account_applied` 只在 fill 首次应用时置 1；`REVERSAL` 也必须有幂等键，且 `qty_delta` 必须能表达冲销数量。
 
-> 结论：PRELIM 可以先用 provisional 台账保证当日执行/风控可用；FORMAL 必须能确认、改费用或冲销重记，但绝不允许同一笔成交并存两笔有效 Fill。
+> 结论：PRELIM 可以先用 provisional 台账保证当日执行/风控可用；FORMAL 必须能确认、改费用或冲销重记，但绝不允许同一笔成交并存两笔有效 Fill。FORMAL 成交集合与 PRELIM provisional 集合必须分别关账，不能用一个“找不到就冲销”的分支混在一起。
 
-#### 9.5.4 手工录入兜底#### 9.5.4 手工录入兜底
+#### 9.5.4 手工录入兜底
 
 - 券商无 CSV 时，提供 `quantx live fill add` 交互式录入；
 - 必须二次确认；
@@ -3786,7 +3819,7 @@ T+1 券商正式对账单/交割单（人工导出）
 #### 9.6.2 对账步骤与弱成交匹配
 
 1. 归一化券商对账单（字段、代码、方向、费用、成交时间、`broker_order_id`）；
-2. 每条券商成交先写 `broker_trade_raw`（按 `(source, raw_hash)` 幂等）；PRELIM 建 `PROVISIONAL` Fill，FORMAL 按 broker_trade_id 或容差匹配同一 Fill；匹配不到则冲销 provisional 后入 formal；结构非法写 `SUSPENSE`，不丢原文；`client_order_id` 可为空；
+2. 每条券商成交先写 `broker_trade_raw`（按 `(source, raw_hash)` 幂等）；PRELIM 建 `PROVISIONAL` Fill，FORMAL 按 broker_trade_id 或容差匹配同一 Fill；formal 无匹配新建 CONFIRMED，provisional 未确认转 ORPHAN 人工处理；结构非法写 `SUSPENSE`，不丢原文；`client_order_id` 可为空；
 3. 成交匹配按优先级：
    1. `broker_trade_id` 精确匹配；
    2. `broker_order_id` + `(trade_date, code, side)` 匹配；
@@ -3799,7 +3832,12 @@ T+1 券商正式对账单/交割单（人工导出）
 8. 对比市值：数量 × 收盘价；
 9. 对比账户快照：总资产、可用资金、持仓数量；
 10. 生成差异列表、严重级别、处理建议；
-11. 硬差异未关闭 -> 次日信号按级别 BLOCK；qty/cash 可信时允许强制退出，qty 不可信时 BLOCK_ALL。
+11. 硬差异未关闭 -> 次日信号按级别 BLOCK；qty/cash 可信时允许强制退出，qty 不可信时 BLOCK_ALL；
+12. **PRELIM 关账规则**：FORMAL PASS 前，T 日每个 provisional fill 必须处于以下之一：
+    - `CONFIRMED`（被某个 formal 确认）；
+    - `SUPERSEDED` 且对应 `REVERSAL` 已应用；
+    - `ORPHAN_FILL` 已人工确认并处理。
+    否则 FORMAL 不能 PASS，最多 `FORMAL_PENDING`；未处理 provisional 不得静默留到下一日。
 
 弱匹配原则：
 
@@ -3807,7 +3845,7 @@ T+1 券商正式对账单/交割单（人工导出）
 - 不能凭空生成 `client_order_id`；只能标记 `UNMATCHED`/`AMBIGUOUS`；
 - 一笔成交可拆给多笔订单，一笔订单也可对应多笔成交；分配必须记录 `match_method` 和操作者；
 - 任何人工分配进入审计日志，不能静默修改；
-- FORMAL 通过的条件：所有成交 `MATCHED`，或 `UNMATCHED/AMBIGUOUS` 已人工分配并记录；`SUSPENSE` 必须先修复；PRELIM/FORMAL 重复 raw 不得产生第二笔 Fill；费用差额走 `fill_adjustment`；
+- FORMAL 通过的条件：所有成交 `MATCHED`，或 `UNMATCHED/AMBIGUOUS` 已人工分配并记录；`SUSPENSE` 必须先修复；PRELIM/FORMAL 重复 raw 不得产生第二笔 Fill；费用差额走 `fill_adjustment`；T 日所有 provisional 已按 9.6.2 第 12 条关账；
 - 内部 `EXPIRED` 不代表券商撤单成功，撤单必须有 `CANCELED_CONFIRMED` 或对账单确认。
 
 #### 9.6.3 差异分类
@@ -3815,7 +3853,8 @@ T+1 券商正式对账单/交割单（人工导出）
 | 差异 | 说明 | 级别 | 处理 |
 |---|---|---|---|
 | `MISSING_FILL` | 券商有成交，系统无/未导入 | P0 | 补录 |
-| `ORPHAN_FILL` | 系统有成交，券商无 | P0 | 核查/撤销 |
+| `ORPHAN_FILL` | 系统有成交，券商无；或 provisional 未被任何 formal 确认 | P0 | 人工确认后冲销/补录 |
+| `MISSING_PRELIM_FILL` | formal 有成交，PRELIM 没有对应 provisional | P1 | 新建 CONFIRMED，告警 |
 | `UNMATCHED_FILL` | 成交存在但找不到订单 | P0 | 人工分配，保留成交 |
 | `SUSPENSE_FILL` | 原始成交结构非法/缺字段 | P0 | 保留 raw，人工修复后再入账 |
 | `LATE_FILL` | 内部过期/撤单后到达的成交 | P0/P1 | 正常记账，更新订单为 LATE_FILL |
@@ -4411,6 +4450,8 @@ CREATE TABLE orders (
     ref_price_cents   INTEGER NOT NULL,
     target_weight     REAL,
     current_qty       INTEGER,
+    locked_qty        INTEGER NOT NULL DEFAULT 0,
+    sellable_qty      INTEGER NOT NULL DEFAULT 0,
     amount_est_cents  INTEGER,
     reason            TEXT,
     priority          INTEGER NOT NULL,
@@ -4464,10 +4505,8 @@ CREATE TABLE fills (
     match_confidence REAL,
     validation_status TEXT NOT NULL, -- VALID/SUSPENSE
     account_applied  INTEGER NOT NULL DEFAULT 0,
-    raw_hash         TEXT,
     created_at       TEXT NOT NULL,
-    UNIQUE(broker_trade_id),
-    UNIQUE(raw_hash)
+    UNIQUE(broker_trade_id)
 );
 
 CREATE INDEX idx_fills_order ON fills(client_order_id);
@@ -4548,9 +4587,9 @@ CREATE TABLE positions (
 CREATE TABLE position_lots (
     lot_id          TEXT PRIMARY KEY,
     code            TEXT NOT NULL,
-    acquired_date   TEXT NOT NULL,
+    acquired_date   TEXT NOT NULL,       -- 入账日
     available_date  TEXT NOT NULL,       -- 买入 T+1；送转股 = new_shares_listing_date（缺失才 ex_date+1）
-    sellable_same_day INTEGER NOT NULL DEFAULT 0,
+    tax_holding_start TEXT NOT NULL,     -- 税持有期起点；送转股继承原 lot
     qty             INTEGER NOT NULL,
     remaining_qty   INTEGER NOT NULL,
     cost_cents      INTEGER NOT NULL,
@@ -4585,10 +4624,8 @@ CREATE TABLE accrual_ledger (
     trade_date      TEXT NOT NULL,
     entry_type      TEXT NOT NULL, -- INTEREST_ACCRUED/INTEREST_RECEIVABLE/DIVIDEND_RECEIVABLE/TAX_ESTIMATE/TAX_FINAL
     amount_cents    INTEGER NOT NULL,
-    status          TEXT NOT NULL, -- OPEN/MATCHED/EXPIRED
     due_date        TEXT,
     ref_id          TEXT,
-    matched_cash_entry_id TEXT,
     created_at      TEXT NOT NULL
 );
 
@@ -4626,8 +4663,10 @@ CREATE TABLE risk_reduction_run (
     locked_market_value_cents INTEGER NOT NULL,
     sold_amount_cents INTEGER NOT NULL,
     remaining_gap   REAL NOT NULL,
-    status          TEXT NOT NULL, -- COMPLETE/PARTIAL/BLOCKED
+    status          TEXT NOT NULL, -- COMPLETE/PARTIAL/BLOCKED/NO_EFFECT
     blocked_reason  TEXT,
+    no_effect_reason TEXT,
+    no_effect_value_cents INTEGER NOT NULL DEFAULT 0,
     next_action     TEXT,
     created_at      TEXT NOT NULL
 );
@@ -4659,10 +4698,6 @@ CREATE TABLE equity_curve (
     market_value_cents INTEGER NOT NULL,
     hwm_cents       INTEGER NOT NULL,
     drawdown        REAL NOT NULL,
-    shadow_nav_cents INTEGER,
-    shadow_hwm_cents INTEGER,
-    shadow_drawdown REAL,
-    sigma_shadow_60 REAL,
     vol_scale       REAL,
     dd_state        TEXT,
     recovery_stage  TEXT,
@@ -4860,7 +4895,7 @@ portfolio:
   min_score_improvement: 0.20
   risk_sell_exempt: true
   min_risk_reduction_abs_cents: 10000   # 最小有效降暴露 100 元
-  min_risk_reduction_pct: 0.01          # 或 1% 权益，取大
+  min_risk_reduction_pct: 0.01          # 或 1% 权益取大，但不超过 min_trade_value
   risk_exposure:
     NORMAL: 1.0
     WATCH: 1.0
@@ -4876,6 +4911,7 @@ risk:
     min_history_days: 60
     model_switch_freeze_days: 60
   drawdown:
+    intraday_worsen_threshold: 0.02
     vol_scale_mode: shadow     # shadow/actual；默认满仓影子组合
     freeze_on_derisk: true
     vol_lookback: 60
